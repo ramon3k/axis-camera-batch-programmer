@@ -1,0 +1,54 @@
+AXIS CAMERA BATCH PROGRAMMER - DISTRIBUTION CHECKLIST
+====================================================
+
+Files to Include in ZIP:
+------------------------
+☐ axis_batch_programmer.py         (Core logic - command line version)
+☐ axis_batch_programmer_gui.py     (GUI version)
+☐ camera_config.csv                (Template CSV file)
+☐ requirements.txt                 (Python dependencies)
+☐ README.md                        (User guide)
+☐ INSTALL.md                       (Installation instructions)
+☐ START_GUI.bat                    (Easy launcher for GUI)
+☐ START_CLI.bat                    (Easy launcher for CLI)
+☐ LICENSE.txt                      (Optional - add your license)
+
+Before Sending:
+---------------
+☐ Clear camera_config.csv (remove your real camera data, leave header + 1 example row)
+☐ Delete axis_programmer.log (if exists)
+☐ Delete __pycache__ folder (if exists)
+☐ Test both launchers on a clean machine
+☐ Verify README has correct contact info
+
+Create ZIP Package:
+-------------------
+1. Select all files above
+2. Right-click > Send to > Compressed (zipped) folder
+3. Name it: AxisCameraBatchProgrammer_v1.0.zip
+4. Send via email, file share, or USB drive
+
+Recipient Instructions (Quick Start):
+--------------------------------------
+1. Extract ZIP to any folder
+2. Double-click START_GUI.bat
+3. Follow prompts to install Python if needed
+4. Edit camera_config.csv with your cameras
+5. Click "Start Programming"
+
+For Large Deployments (1000+ cameras):
+---------------------------------------
+Recommend they:
+- Run on a dedicated laptop/workstation on-site
+- Use Gigabit Ethernet connection
+- Process cameras in batches (50-100 per batch on a switch)
+- Multiple team members with multiple workstations = parallel processing
+- Consider scripting CSV generation from existing systems
+
+Security Recommendations for Recipient:
+----------------------------------------
+- Store CSV files encrypted (contains passwords)
+- Use strong, unique passwords for each deployment
+- Secure the workstation used for programming
+- Delete CSV after deployment or store offline
+- Keep audit logs of programmed cameras
