@@ -179,7 +179,10 @@ class AxisBatchProgrammerGUI:
         
         # Tags for row colors
         self.tree.tag_configure('pending', background='#ecf0f1')
+        self.tree.tag_configure('scanning', background='#3498db', foreground='white')
         self.tree.tag_configure('discovering', background='#3498db', foreground='white')
+        self.tree.tag_configure('found', background='#2ecc71', foreground='white')
+        self.tree.tag_configure('not_found', background='#95a5a6', foreground='white')
         self.tree.tag_configure('configuring', background='#f39c12', foreground='white')
         self.tree.tag_configure('completed', background='#27ae60', foreground='white')
         self.tree.tag_configure('failed', background='#e74c3c', foreground='white')
@@ -218,6 +221,14 @@ class AxisBatchProgrammerGUI:
             width=20
         )
         self.start_button.pack(side=tk.LEFT, padx=(0, 5))
+        
+        self.scan_button = ttk.Button(
+            button_frame,
+            text="Scan Only",
+            command=self.scan_only,
+            width=15
+        )
+        self.scan_button.pack(side=tk.LEFT, padx=(0, 5))
         
         self.stop_button = ttk.Button(
             button_frame,
@@ -350,8 +361,14 @@ class AxisBatchProgrammerGUI:
         tag = 'pending'
         if status:
             status_lower = status.lower()
-            if 'discover' in status_lower:
+            if 'scan' in status_lower:
+                tag = 'scanning'
+            elif 'discover' in status_lower:
                 tag = 'discovering'
+            elif 'found' == status_lower:
+                tag = 'found'
+            elif 'not found' in status_lower or 'not_found' in status_lower:
+                tag = 'not_found'
             elif 'configur' in status_lower:
                 tag = 'configuring'
             elif 'completed' in status_lower or 'success' in status_lower:
@@ -401,6 +418,7 @@ class AxisBatchProgrammerGUI:
         # Update UI state
         self.is_running = True
         self.start_button.config(state=tk.DISABLED)
+        self.scan_button.config(state=tk.DISABLED)
         self.stop_button.config(state=tk.NORMAL)
         self.update_status_bar("Starting batch programming...")
         
@@ -412,8 +430,40 @@ class AxisBatchProgrammerGUI:
         """Stop the batch programming process."""
         self.is_running = False
         self.start_button.config(state=tk.NORMAL)
+        self.scan_button.config(state=tk.NORMAL)
         self.stop_button.config(state=tk.DISABLED)
         self.update_status_bar("Stopping...")
+        
+    def scan_only(self):
+        """Scan for cameras without programming them."""
+        if self.is_running:
+            return
+        
+        if not self.configs:
+            messagebox.showwarning("No Cameras", "Please load a CSV file with camera configurations.")
+            return
+        
+        # Confirm scan
+        result = messagebox.askyesno(
+            "Scan for Cameras",
+            f"Scan network for {len(self.configs)} camera(s)?\n\n"
+            "This will discover cameras and update their Current IP addresses "
+            "without programming them."
+        )
+        
+        if not result:
+            return
+        
+        # Update UI state
+        self.is_running = True
+        self.start_button.config(state=tk.DISABLED)
+        self.scan_button.config(state=tk.DISABLED)
+        self.stop_button.config(state=tk.NORMAL)
+        self.update_status_bar("Scanning for cameras...")
+        
+        # Start scan worker thread
+        thread = threading.Thread(target=self.scan_worker, daemon=True)
+        thread.start()
         
     def programming_worker(self):
         """Worker thread that runs the batch programming logic."""
@@ -535,6 +585,92 @@ class AxisBatchProgrammerGUI:
             def reset_ui():
                 self.is_running = False
                 self.start_button.config(state=tk.NORMAL)
+                self.scan_button.config(state=tk.NORMAL)
+                self.stop_button.config(state=tk.DISABLED)
+            
+            self.root.after(0, reset_ui)
+    
+    def scan_worker(self):
+        """Worker thread that scans for cameras without programming."""
+        try:
+            logger = logging.getLogger('axis_programmer')
+            logger.info("="*70)
+            logger.info("Scanning for Cameras (Discovery Only)")
+            logger.info("="*70)
+            
+            # Update all cameras to "Scanning" status
+            for cfg in self.configs:
+                self.status_queue.put({
+                    'mac': cfg['mac'],
+                    'status': 'Scanning',
+                    'message': 'Searching for camera on network...'
+                })
+            
+            self.status_queue.put({'status_bar': 'Discovering cameras...'})
+            
+            # Discover cameras
+            logger.info(f"\nScanning for {len(self.configs)} camera(s) on network...")
+            discovered = discover_cameras_on_network(self.configs)
+            
+            if not discovered:
+                logger.warning("No cameras discovered!")
+                self.status_queue.put({'status_bar': 'Scan complete - no cameras found'})
+                
+                for cfg in self.configs:
+                    self.status_queue.put({
+                        'mac': cfg['mac'],
+                        'current_ip': 'Not Found',
+                        'status': 'Not Found',
+                        'message': 'Camera not found on network'
+                    })
+            else:
+                logger.info(f"\nScan complete! Discovered {len(discovered)} camera(s)")
+                
+                # Create lookup of discovered cameras
+                discovered_macs = {cam['mac']: cam for cam in discovered}
+                
+                # Update all cameras with scan results
+                for cfg in self.configs:
+                    mac = cfg['mac']
+                    if mac in discovered_macs:
+                        cam_info = discovered_macs[mac]
+                        self.status_queue.put({
+                            'mac': mac,
+                            'current_ip': cam_info['ip'],
+                            'status': 'Found',
+                            'message': f"Connected at {cam_info['ip']} (via {cam_info.get('method', 'unknown')})"
+                        })
+                        logger.info(f"  ✓ {mac}: {cam_info['ip']}")
+                    else:
+                        self.status_queue.put({
+                            'mac': mac,
+                            'current_ip': 'Not Found',
+                            'status': 'Not Found',
+                            'message': 'Camera not found on network'
+                        })
+                        logger.info(f"  ✗ {mac}: Not found")
+                
+                self.status_queue.put({
+                    'status_bar': f'Scan complete - Found {len(discovered)}/{len(self.configs)} cameras'
+                })
+            
+            logger.info("\n" + "="*70)
+            logger.info("Scan Complete")
+            logger.info(f"  Found: {len(discovered)}")
+            logger.info(f"  Not Found: {len(self.configs) - len(discovered)}")
+            logger.info(f"  Total: {len(self.configs)}")
+            logger.info("="*70)
+            
+        except Exception as e:
+            logger.error(f"Scan worker error: {e}", exc_info=True)
+            self.status_queue.put({'status_bar': f'Scan error: {e}'})
+            
+        finally:
+            # Re-enable buttons
+            def reset_ui():
+                self.is_running = False
+                self.start_button.config(state=tk.NORMAL)
+                self.scan_button.config(state=tk.NORMAL)
                 self.stop_button.config(state=tk.DISABLED)
             
             self.root.after(0, reset_ui)
