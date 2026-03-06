@@ -186,6 +186,11 @@ class AxisBatchProgrammerGUI:
         self.tree.tag_configure('configuring', background='#f39c12', foreground='white')
         self.tree.tag_configure('completed', background='#27ae60', foreground='white')
         self.tree.tag_configure('failed', background='#e74c3c', foreground='white')
+        # Test mode tags
+        self.tree.tag_configure('Testing', background='#3498db', foreground='white')
+        self.tree.tag_configure('Compatible', background='#27ae60', foreground='white')
+        self.tree.tag_configure('Mostly Compatible', background='#f39c12', foreground='white')
+        self.tree.tag_configure('Issues Found', background='#e67e22', foreground='white')
         
         # Grid layout
         self.tree.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
@@ -229,6 +234,14 @@ class AxisBatchProgrammerGUI:
             width=15
         )
         self.scan_button.pack(side=tk.LEFT, padx=(0, 5))
+        
+        self.test_button = ttk.Button(
+            button_frame,
+            text="Test Mode",
+            command=self.test_mode,
+            width=15
+        )
+        self.test_button.pack(side=tk.LEFT, padx=(0, 5))
         
         self.stop_button = ttk.Button(
             button_frame,
@@ -419,6 +432,7 @@ class AxisBatchProgrammerGUI:
         self.is_running = True
         self.start_button.config(state=tk.DISABLED)
         self.scan_button.config(state=tk.DISABLED)
+        self.test_button.config(state=tk.DISABLED)
         self.stop_button.config(state=tk.NORMAL)
         self.update_status_bar("Starting batch programming...")
         
@@ -431,6 +445,7 @@ class AxisBatchProgrammerGUI:
         self.is_running = False
         self.start_button.config(state=tk.NORMAL)
         self.scan_button.config(state=tk.NORMAL)
+        self.test_button.config(state=tk.NORMAL)
         self.stop_button.config(state=tk.DISABLED)
         self.update_status_bar("Stopping...")
         
@@ -458,6 +473,7 @@ class AxisBatchProgrammerGUI:
         self.is_running = True
         self.start_button.config(state=tk.DISABLED)
         self.scan_button.config(state=tk.DISABLED)
+        self.test_button.config(state=tk.DISABLED)
         self.stop_button.config(state=tk.NORMAL)
         self.update_status_bar("Scanning for cameras...")
         
@@ -586,6 +602,7 @@ class AxisBatchProgrammerGUI:
                 self.is_running = False
                 self.start_button.config(state=tk.NORMAL)
                 self.scan_button.config(state=tk.NORMAL)
+                self.test_button.config(state=tk.NORMAL)
                 self.stop_button.config(state=tk.DISABLED)
             
             self.root.after(0, reset_ui)
@@ -671,10 +688,139 @@ class AxisBatchProgrammerGUI:
                 self.is_running = False
                 self.start_button.config(state=tk.NORMAL)
                 self.scan_button.config(state=tk.NORMAL)
+                self.test_button.config(state=tk.NORMAL)
                 self.stop_button.config(state=tk.DISABLED)
             
             self.root.after(0, reset_ui)
+    
+    def test_mode(self):
+        """Test camera compatibility without making changes."""
+        if self.is_running:
+            return
+        
+        if not self.configs:
+            messagebox.showwarning("No Cameras", "Please load a CSV file with camera configurations.")
+            return
+        
+        # Confirm test
+        result = messagebox.askyesno(
+            "Test Camera Compatibility",
+            f"Test compatibility of cameras?\n\n"
+            "This will scan for cameras and test their VAPIX compatibility "
+            "WITHOUT making any configuration changes.\n\n"
+            "Recommended for testing new camera models before bulk programming."
+        )
+        
+        if not result:
+            return
+        
+        # Update UI state
+        self.is_running = True
+        self.start_button.config(state=tk.DISABLED)
+        self.scan_button.config(state=tk.DISABLED)
+        self.test_button.config(state=tk.DISABLED)
+        self.stop_button.config(state=tk.NORMAL)
+        self.update_status_bar("Testing camera compatibility...")
+        
+        # Start test worker thread
+        thread = threading.Thread(target=self.test_worker, daemon=True)
+        thread.start()
+    
+    def test_worker(self):
+        """Worker thread that tests camera compatibility."""
+        try:
+            logger = logging.getLogger('axis_programmer')
+            logger.info("="*70)
+            logger.info("Camera Compatibility Test Mode")
+            logger.info("="*70)
             
+            # Update cameras to "Testing" status
+            for cfg in self.configs:
+                self.status_queue.put({
+                    'mac': cfg['mac'],
+                    'status': 'Testing',
+                    'message': 'Discovering camera...'
+                })
+            
+            # Step 1: Discover cameras
+            logger.info(f"\nDiscovering {len(self.configs)} camera(s)...")
+            discovered = discover_cameras_on_network(self.configs)
+            
+            if not discovered:
+                logger.warning("No cameras discovered!")
+                self.status_queue.put({'status_bar': 'Test complete - no cameras found'})
+                
+                for cfg in self.configs:
+                    self.status_queue.put({
+                        'mac': cfg['mac'],
+                        'current_ip': 'Not Found',
+                        'status': 'Not Found',
+                        'message': 'Camera not found on network'
+                    })
+            else:
+                logger.info(f"Found {len(discovered)} camera(s)\n")
+                
+                # Step 2: Test each discovered camera
+                for cam_info in discovered:
+                    if not self.is_running:
+                        break
+                    
+                    mac = cam_info['mac']
+                    camera = cam_info['camera']
+                    
+                    self.status_queue.put({
+                        'mac': mac,
+                        'current_ip': cam_info['ip'],
+                        'status': 'Testing',
+                        'message': 'Running compatibility tests...'
+                    })
+                    
+                    # Run compatibility test
+                    results = camera.test_compatibility()
+                    
+                    # Determine overall status
+                    pass_count = sum(1 for v in results['tests'].values() if v == 'PASS')
+                    fail_count = sum(1 for v in results['tests'].values() if v == 'FAIL')
+                    
+                    if fail_count == 0:
+                        status = 'Compatible'
+                        message = f"✓ Fully compatible - {results['camera_model']}"
+                    elif fail_count <= 2 and pass_count >= 3:
+                        status = 'Mostly Compatible'
+                        message = f"⚠ Mostly compatible - {results['camera_model']} ({fail_count} warnings)"
+                    else:
+                        status = 'Issues Found'
+                        message = f"⚠ Compatibility issues - {results['camera_model']} ({fail_count} failures)"
+                    
+                    self.status_queue.put({
+                        'mac': mac,
+                        'status': status,
+                        'message': message
+                    })
+                
+                self.status_queue.put({
+                    'status_bar': f'Compatibility test complete - Tested {len(discovered)} camera(s)'
+                })
+            
+            logger.info("\nCompatibility testing complete!")
+            logger.info("Review the log output for detailed test results.")
+            logger.info("="*70)
+            
+        except Exception as e:
+            logger.error(f"Test worker error: {e}", exc_info=True)
+            self.status_queue.put({'status_bar': f'Test error: {e}'})
+            
+        finally:
+            # Re-enable buttons
+            def reset_ui():
+                self.is_running = False
+                self.start_button.config(state=tk.NORMAL)
+                self.scan_button.config(state=tk.NORMAL)
+                self.test_button.config(state=tk.NORMAL)
+                self.stop_button.config(state=tk.DISABLED)
+            
+            self.root.after(0, reset_ui)
+    
     def check_status_updates(self):
         """Check for status updates from the worker thread."""
         try:

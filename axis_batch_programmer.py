@@ -447,6 +447,177 @@ class AxisCamera:
         except Exception as e:
             logger.error(f"Error verifying configuration: {e}")
             return False
+    
+    def test_compatibility(self) -> Dict[str, any]:
+        """Test camera compatibility without making changes.
+        
+        Returns dictionary with test results for each function.
+        """
+        results = {
+            'camera_model': 'Unknown',
+            'firmware': 'Unknown',
+            'current_ip': self.ip,
+            'mac_address': None,
+            'tests': {}
+        }
+        
+        try:
+            logger.info(f"\n{'='*60}")
+            logger.info(f"Testing Camera Compatibility: {self.ip}")
+            logger.info(f"{'='*60}")
+            
+            # Test 1: Basic connectivity
+            logger.info("Test 1: Basic Connectivity")
+            try:
+                response = self.session.get(
+                    f"http://{self.ip}/axis-cgi/param.cgi?action=list&group=root.Brand",
+                    timeout=VAPIX_TIMEOUT
+                )
+                if response.status_code == 200:
+                    results['tests']['connectivity'] = 'PASS'
+                    logger.info("  ✓ Connection successful")
+                    
+                    # Try to get model info
+                    for line in response.text.split('\n'):
+                        if 'ProdFullName' in line:
+                            results['camera_model'] = line.split('=')[1].strip()
+                        elif 'Version' in line:
+                            results['firmware'] = line.split('=')[1].strip()
+                else:
+                    results['tests']['connectivity'] = 'FAIL'
+                    logger.error(f"  ✗ Connection failed: {response.status_code}")
+            except Exception as e:
+                results['tests']['connectivity'] = 'FAIL'
+                logger.error(f"  ✗ Connection failed: {e}")
+                return results
+            
+            # Test 2: MAC address retrieval
+            logger.info("\nTest 2: MAC Address Retrieval")
+            try:
+                mac = self.get_mac_address()
+                if mac:
+                    results['mac_address'] = mac
+                    results['tests']['mac_retrieval'] = 'PASS'
+                    logger.info(f"  ✓ MAC Address: {mac}")
+                else:
+                    results['tests']['mac_retrieval'] = 'FAIL'
+                    logger.error("  ✗ Could not retrieve MAC address")
+            except Exception as e:
+                results['tests']['mac_retrieval'] = 'FAIL'
+                logger.error(f"  ✗ MAC retrieval error: {e}")
+            
+            # Test 3: Network configuration read
+            logger.info("\nTest 3: Network Configuration Read")
+            try:
+                response = self.session.get(
+                    f"http://{self.ip}/axis-cgi/param.cgi?action=list&group=Network",
+                    timeout=VAPIX_TIMEOUT
+                )
+                if response.status_code == 200 and 'Network.IPAddress' in response.text:
+                    results['tests']['network_read'] = 'PASS'
+                    logger.info("  ✓ Can read network configuration")
+                    
+                    # Extract current settings
+                    for line in response.text.split('\n'):
+                        if 'Network.IPAddress=' in line:
+                            logger.info(f"    Current IP: {line.split('=')[1].strip()}")
+                        elif 'Network.SubnetMask=' in line:
+                            logger.info(f"    Current Subnet: {line.split('=')[1].strip()}")
+                        elif 'Network.DefaultRouter=' in line:
+                            logger.info(f"    Current Gateway: {line.split('=')[1].strip()}")
+                else:
+                    results['tests']['network_read'] = 'FAIL'
+                    logger.error("  ✗ Cannot read network configuration")
+            except Exception as e:
+                results['tests']['network_read'] = 'FAIL'
+                logger.error(f"  ✗ Network read error: {e}")
+            
+            # Test 4: User management endpoint
+            logger.info("\nTest 4: User Management Capability")
+            try:
+                response = self.session.get(
+                    f"http://{self.ip}/axis-cgi/pwdgrp.cgi?action=get",
+                    timeout=VAPIX_TIMEOUT
+                )
+                if response.status_code == 200 or response.status_code == 204:
+                    results['tests']['user_management'] = 'PASS'
+                    logger.info("  ✓ User management endpoint accessible")
+                else:
+                    results['tests']['user_management'] = 'WARN'
+                    logger.warning(f"  ⚠ User management returned: {response.status_code}")
+            except Exception as e:
+                results['tests']['user_management'] = 'WARN'
+                logger.warning(f"  ⚠ User management test: {e}")
+            
+            # Test 5: DateTime configuration
+            logger.info("\nTest 5: Date/Time Configuration")
+            try:
+                response = self.session.get(
+                    f"http://{self.ip}/axis-cgi/param.cgi?action=list&group=Time",
+                    timeout=VAPIX_TIMEOUT
+                )
+                if response.status_code == 200 and 'Time.TimeZone' in response.text:
+                    results['tests']['datetime'] = 'PASS'
+                    logger.info("  ✓ Timezone configuration supported")
+                else:
+                    results['tests']['datetime'] = 'WARN'
+                    logger.warning("  ⚠ Timezone configuration may not be supported")
+            except Exception as e:
+                results['tests']['datetime'] = 'WARN'
+                logger.warning(f"  ⚠ DateTime test: {e}")
+            
+            # Test 6: Camera name/hostname
+            logger.info("\nTest 6: Camera Name Configuration")
+            try:
+                response = self.session.get(
+                    f"http://{self.ip}/axis-cgi/param.cgi?action=list&group=System",
+                    timeout=VAPIX_TIMEOUT
+                )
+                if response.status_code == 200 and ('System.HostName' in response.text or 'System.Name' in response.text):
+                    results['tests']['camera_name'] = 'PASS'
+                    logger.info("  ✓ Camera name configuration supported")
+                else:
+                    results['tests']['camera_name'] = 'WARN'
+                    logger.warning("  ⚠ Camera name configuration may not be supported")
+            except Exception as e:
+                results['tests']['camera_name'] = 'WARN'
+                logger.warning(f"  ⚠ Camera name test: {e}")
+            
+            # Summary
+            logger.info(f"\n{'='*60}")
+            logger.info("Compatibility Test Summary")
+            logger.info(f"{'='*60}")
+            logger.info(f"Model: {results['camera_model']}")
+            logger.info(f"Firmware: {results['firmware']}")
+            logger.info(f"MAC: {results.get('mac_address', 'Unknown')}")
+            logger.info("")
+            
+            pass_count = sum(1 for v in results['tests'].values() if v == 'PASS')
+            warn_count = sum(1 for v in results['tests'].values() if v == 'WARN')
+            fail_count = sum(1 for v in results['tests'].values() if v == 'FAIL')
+            
+            for test_name, test_result in results['tests'].items():
+                icon = '✓' if test_result == 'PASS' else ('⚠' if test_result == 'WARN' else '✗')
+                logger.info(f"  {icon} {test_name}: {test_result}")
+            
+            logger.info("")
+            logger.info(f"Results: {pass_count} PASS, {warn_count} WARN, {fail_count} FAIL")
+            
+            if fail_count == 0:
+                logger.info("\n✓ Camera is FULLY COMPATIBLE - All critical functions work!")
+            elif fail_count <= 2 and pass_count >= 3:
+                logger.info("\n⚠ Camera is MOSTLY COMPATIBLE - Core functions work, some features may not")
+            else:
+                logger.error("\n✗ Camera may have COMPATIBILITY ISSUES - Review test results")
+            
+            logger.info(f"{'='*60}\n")
+            
+            return results
+            
+        except Exception as e:
+            logger.error(f"Compatibility test error: {e}")
+            results['tests']['overall'] = 'ERROR'
+            return results
 
 
 def get_arp_table() -> Dict[str, str]:
