@@ -38,7 +38,7 @@ logger = logging.getLogger(__name__)
 
 # Constants
 DEFAULT_IP = "192.168.0.90"
-DEFAULT_USER = "root"
+DEFAULT_USER = "root"  # Note: Older models use "root", newer models (P3267-LV) use "admin"
 DEFAULT_PASS = ""  # Factory default has no password
 FACTORY_INITIAL_PASSWORD = "pass"  # Temporary password to set on factory-fresh cameras during discovery
 VAPIX_TIMEOUT = 30  # For managed switches with rate limiting, increase to 30-60 seconds
@@ -788,32 +788,36 @@ def discover_cameras_on_network(configs: List[Dict] = None) -> List[Dict]:
     # Method 1: Try to connect to default IP directly (works if on same network)
     logger.info("Method 1: Direct connection to default IP...")
     
-    # Try factory credentials first
+    # Try factory credentials - different models use different defaults
     camera = None
     mac = None
-    try:
-        camera = AxisCamera(DEFAULT_IP, "", "root", "")
-        logger.debug(f"Attempting to connect to {DEFAULT_IP} with factory credentials...")
-        
-        # Try initial password setup if needed (factory-fresh cameras)
-        camera.setup_initial_password(FACTORY_INITIAL_PASSWORD)
-        
-        # Try to get MAC address directly
-        mac = camera.get_mac_address()
-        if mac and mac not in discovered_macs:
-            discovered.append({
-                'ip': DEFAULT_IP,
-                'mac': mac,
-                'method': 'direct',
-                'auth_method': 'factory',
-                'interface': 'default',
-                'camera': camera
-            })
-            discovered_macs.add(mac)
-            logger.info(f"[OK] Found camera at {DEFAULT_IP} with MAC {mac} (factory credentials)")
-    except Exception as e:
-        logger.debug(f"Factory credentials failed at {DEFAULT_IP}: {e}")
-        camera = None
+    factory_credentials = [("root", ""), ("admin", "")]
+    
+    for factory_user, factory_pass in factory_credentials:
+        try:
+            logger.debug(f"Attempting to connect to {DEFAULT_IP} with {factory_user} credentials...")
+            camera = AxisCamera(DEFAULT_IP, "", factory_user, factory_pass)
+            
+            # Try initial password setup if needed (factory-fresh cameras)
+            camera.setup_initial_password(FACTORY_INITIAL_PASSWORD)
+            
+            # Try to get MAC address directly
+            mac = camera.get_mac_address()
+            if mac and mac not in discovered_macs:
+                discovered.append({
+                    'ip': DEFAULT_IP,
+                    'mac': mac,
+                    'method': 'direct',
+                    'auth_method': f'factory_{factory_user}',
+                    'interface': 'default',
+                    'camera': camera
+                })
+                discovered_macs.add(mac)
+                logger.info(f"[OK] Found camera at {DEFAULT_IP} with MAC {mac} (factory {factory_user} credentials)")
+                break  # Found working credentials
+        except Exception as e:
+            logger.debug(f"Factory {factory_user} credentials failed at {DEFAULT_IP}: {e}")
+            camera = None
     
     # If factory credentials failed, try CSV credentials
     if not camera and config_by_mac:
@@ -865,30 +869,34 @@ def discover_cameras_on_network(configs: List[Dict] = None) -> List[Dict]:
                 if ip in [d['ip'] for d in discovered]:
                     continue
                     
-                # Try factory credentials first
+                # Try factory credentials - different models use different defaults
                 camera = None
                 mac = None
-                try:
-                    logger.debug(f"  Trying {ip} with factory credentials...")
-                    camera = AxisCamera(ip, "", "root", "")
-                    camera.setup_initial_password(FACTORY_INITIAL_PASSWORD)
-                    mac = camera.get_mac_address()
-                    
-                    if mac and mac not in discovered_macs:
-                        camera.mac = mac
-                        discovered.append({
-                            'ip': ip,
-                            'mac': mac,
-                            'method': 'subnet_scan',
-                            'auth_method': 'factory',
-                            'interface': interface_name,
-                            'camera': camera
-                        })
-                        discovered_macs.add(mac)
-                        logger.info(f"  [OK] Found camera at {ip} with MAC {mac} (factory credentials, via {interface_name})")
-                except Exception as e:
-                    logger.debug(f"  Factory credentials failed: {e}")
-                    camera = None
+                factory_credentials = [("root", ""), ("admin", "")]
+                
+                for factory_user, factory_pass in factory_credentials:
+                    try:
+                        logger.debug(f"  Trying {ip} with {factory_user} credentials...")
+                        camera = AxisCamera(ip, "", factory_user, factory_pass)
+                        camera.setup_initial_password(FACTORY_INITIAL_PASSWORD)
+                        mac = camera.get_mac_address()
+                        
+                        if mac and mac not in discovered_macs:
+                            camera.mac = mac
+                            discovered.append({
+                                'ip': ip,
+                                'mac': mac,
+                                'method': 'subnet_scan',
+                                'auth_method': f'factory_{factory_user}',
+                                'interface': interface_name,
+                                'camera': camera
+                            })
+                            discovered_macs.add(mac)
+                            logger.info(f"  [OK] Found camera at {ip} with MAC {mac} (factory {factory_user} credentials, via {interface_name})")
+                            break  # Found working credentials
+                    except Exception as e:
+                        logger.debug(f"  Factory {factory_user} credentials failed: {e}")
+                        camera = None
                 
                 # If factory credentials failed, try CSV credentials
                 if not camera and config_by_mac:
@@ -972,23 +980,38 @@ def discover_cameras_on_network(configs: List[Dict] = None) -> List[Dict]:
                 camera = None
                 auth_method = None
                 
-                try:
-                    # Try 1: Factory default credentials (root with empty password)
-                    logger.info(f"  Attempting {ip} ({mac}) with factory credentials (root/empty)...")
-                    camera = AxisCamera(ip, mac, "root", "")
-                    camera.setup_initial_password(FACTORY_INITIAL_PASSWORD)  # Handle factory-fresh cameras
-                    camera_mac = camera.get_mac_address()
-                    
-                    if camera_mac and camera_mac == mac:
-                        auth_method = 'factory'
-                        logger.info(f"  ✓ SUCCESS: Camera at {ip} authenticated with factory credentials")
-                    else:
-                        camera = None
-                except Exception as e:
-                    logger.debug(f"  Factory credentials failed: {e}")
-                    camera = None
+                # Try factory credentials - different models use different defaults
+                factory_credentials = [
+                    ("root", ""),      # Most Axis cameras (older models)
+                    ("admin", ""),     # Newer models like P3267-LV
+                    ("root", FACTORY_INITIAL_PASSWORD),   # Factory-fresh with initial password
+                    ("admin", FACTORY_INITIAL_PASSWORD),  # Newer models factory-fresh
+                ]
                 
-                # Try 2: CSV credentials (for already-programmed cameras)
+                for factory_user, factory_pass in factory_credentials:
+                    try:
+                        pass_desc = "empty" if factory_pass == "" else factory_pass
+                        logger.info(f"  Attempting {ip} ({mac}) with factory credentials ({factory_user}/{pass_desc})...")
+                        camera = AxisCamera(ip, mac, factory_user, factory_pass)
+                        
+                        # Try initial password setup for factory-fresh cameras
+                        if factory_pass == "":
+                            camera.setup_initial_password(FACTORY_INITIAL_PASSWORD)
+                        
+                        camera_mac = camera.get_mac_address()
+                        
+                        if camera_mac and camera_mac == mac:
+                            auth_method = f'factory_{factory_user}'
+                            logger.info(f"  ✓ SUCCESS: Camera at {ip} authenticated with {factory_user}/{pass_desc}")
+                            break  # Found working credentials
+                        else:
+                            camera = None
+                    except Exception as e:
+                        logger.debug(f"  Factory credentials {factory_user}/{pass_desc} failed: {e}")
+                        camera = None
+                        continue
+                
+                # Try CSV credentials (for already-programmed cameras)
                 if not camera and cfg:
                     try:
                         logger.info(f"  Attempting {ip} ({mac}) with CSV credentials (user: {csv_username})...")
