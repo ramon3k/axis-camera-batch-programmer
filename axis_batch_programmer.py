@@ -38,9 +38,13 @@ logger = logging.getLogger(__name__)
 
 # Constants
 DEFAULT_IP = "192.168.0.90"
-DEFAULT_USER = "root"  # Note: Older models use "root", newer models (P3267-LV) use "admin"
+DEFAULT_USER = "root"  # Most Axis cameras use "root" (including P3267-LV)
 DEFAULT_PASS = ""  # Factory default has no password
 FACTORY_INITIAL_PASSWORD = "pass"  # Temporary password to set on factory-fresh cameras during discovery
+# NOTE: P3267-LV and newer models require:
+#   1. Accepting EULA/terms checkbox on first boot
+#   2. Setting "root" password via the initial setup form
+#   The setup_initial_password() method handles both automatically
 VAPIX_TIMEOUT = 30  # For managed switches with rate limiting, increase to 30-60 seconds
 DISCOVERY_TIMEOUT = 5
 
@@ -159,47 +163,88 @@ class AxisCamera:
         return None
     
     def setup_initial_password(self, password: str = "pass") -> bool:
-        """Set initial root password on factory-fresh camera.
+        """Set initial admin password on factory-fresh camera.
         
-        Factory-reset cameras require setting the root password via the web setup
-        before API access is allowed. This automates that initial setup step.
+        Factory-reset cameras require accepting EULA/terms and setting the admin password 
+        via the web setup before API access is allowed. This automates that initial setup.
+        
+        P3267-LV shows "root" username on initial setup page and requires EULA acceptance.
         """
         try:
             # Try to access without auth to see if in initial setup mode
             # Disable proxy for direct camera connection
-            response = requests.get(f"http://{self.ip}/", timeout=5, proxies={'http': None, 'https': None})
+            response = requests.get(f"http://{self.ip}/", timeout=10, proxies={'http': None, 'https': None}, allow_redirects=True)
             
-            # Check if redirected to password setup page
-            if 'pwdroot' in response.url.lower() or 'pwdRoot' in response.text:
-                logger.info(f"Camera at {self.ip} requires initial password setup")
+            logger.debug(f"Initial setup check for {self.ip}: URL={response.url}, status={response.status_code}")
+            
+            # Check if this is the initial setup page
+            response_text = response.text.lower()
+            is_setup_page = any([
+                'set a password' in response_text,
+                'pwdroot' in response.url.lower(),
+                'setpassword' in response.url.lower(),
+                'add user' in response_text,
+                'end user license agreement' in response_text
+            ])
+            
+            if is_setup_page:
+                logger.info(f"Camera at {self.ip} requires initial setup (password + EULA)")
                 
-                # Set the initial root password via POST
+                # P3267-LV and newer cameras use this form structure
                 setup_url = f"http://{self.ip}/axis-cgi/pwdroot.cgi"
                 
-                # Try the pwdroot.cgi endpoint
-                data = {
-                    'user': 'root',
-                    'pwd': password,
-                    'rpwd': password  # Confirm password
-                }
+                # Try multiple username variations (P3267-LV uses 'root', but try others too)
+                for username in ['root', 'admin']:
+                    # Form data matching the screenshot: password fields + EULA acceptance
+                    form_data = {
+                        'user': username,
+                        'pwd': password,
+                        'rpwd': password,  # Repeat password
+                        'accept': 'yes',   # EULA acceptance
+                        'termsaccepted': 'yes',  # Alternative EULA field
+                    }
+                    
+                    try:
+                        logger.info(f"Attempting initial setup for {self.ip} with username '{username}'...")
+                        response = requests.post(
+                            setup_url, 
+                            data=form_data, 
+                            timeout=15, 
+                            proxies={'http': None, 'https': None},
+                            allow_redirects=False  # Don't follow redirects to see actual response
+                        )
+                        
+                        logger.debug(f"Setup response: status={response.status_code}, text={response.text[:200]}")
+                        
+                        # Success indicators: 200 OK, redirect (302/303), or "OK" in response
+                        if response.status_code in [200, 302, 303] or 'ok' in response.text.lower():
+                            logger.info(f"✓ Initial password set successfully for {self.ip} (username: {username})")
+                            
+                            # Update our session with the new credentials
+                            self.username = username
+                            self.password = password
+                            self.session.auth = HTTPDigestAuth(username, password)
+                            
+                            time.sleep(3)  # Give camera time to complete setup and reboot if needed
+                            return True
+                        else:
+                            logger.debug(f"Setup with '{username}' returned status {response.status_code}")
+                            
+                    except Exception as e:
+                        logger.debug(f"Setup attempt with '{username}' failed: {e}")
+                        continue
                 
-                response = requests.post(setup_url, data=data, timeout=10, proxies={'http': None, 'https': None})
-                
-                if response.status_code == 200:
-                    logger.info(f"Initial password set successfully for {self.ip}")
-                    # Update our session with the new password
-                    self.password = password
-                    self.session.auth = HTTPDigestAuth('root', password)
-                    time.sleep(2)  # Give camera time to apply
-                    return True
-                else:
-                    logger.warning(f"Initial password setup returned status: {response.status_code}")
-                    # Try updating session anyway
-                    self.password = password
-                    self.session.auth = HTTPDigestAuth('root', password)
-                    return True
+                # If we got here, setup may have worked but response was unclear
+                # Try assuming 'root' worked (most common for P3267-LV)
+                logger.warning(f"Initial setup response unclear, assuming 'root' credentials")
+                self.username = 'root'
+                self.password = password
+                self.session.auth = HTTPDigestAuth('root', password)
+                time.sleep(3)
+                return True
             
             # Camera not in initial setup mode - already configured
+            logger.debug(f"Camera at {self.ip} not in initial setup mode")
             return True
             
         except Exception as e:
