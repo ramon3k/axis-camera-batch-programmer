@@ -10,7 +10,7 @@ import psutil
 from requests.auth import HTTPDigestAuth
 import time
 
-DEFAULT_IP = "192.168.0.90"
+DEFAULT_IP = "192.168.1.92"
 DEFAULT_USER = "root"
 DEFAULT_PASS = "pass"
 TIMEOUT = 5
