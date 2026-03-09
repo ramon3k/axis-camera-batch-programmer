@@ -40,7 +40,8 @@ logger = logging.getLogger(__name__)
 DEFAULT_IP = "192.168.0.90"
 DEFAULT_USER = "root"
 DEFAULT_PASS = ""  # Factory default has no password
-VAPIX_TIMEOUT = 10
+FACTORY_INITIAL_PASSWORD = "pass"  # Temporary password to set on factory-fresh cameras during discovery
+VAPIX_TIMEOUT = 30  # For managed switches with rate limiting, increase to 30-60 seconds
 DISCOVERY_TIMEOUT = 5
 
 # Timezone mapping: Common timezone names to POSIX format  
@@ -97,6 +98,14 @@ class AxisCamera:
         self.session = requests.Session()
         self.session.auth = HTTPDigestAuth(username, password)
         
+        # CRITICAL FIX: Disable proxy for direct camera connections
+        # Corporate laptops often have proxy settings that break direct IP connections
+        self.session.trust_env = False  # Ignore system proxy settings
+        self.session.proxies = {
+            'http': None,
+            'https': None
+        }
+        
     def test_connection(self) -> bool:
         """Test if we can connect to the camera."""
         try:
@@ -134,8 +143,19 @@ class AxisCamera:
                     if 'MACAddress' in line:
                         mac = line.split('=')[1].strip().upper()
                         return mac
+                logger.warning(f"No MAC address found in response from {self.ip}")
+            elif response.status_code == 401:
+                logger.warning(f"Authentication failed at {self.ip} (401 Unauthorized) - Wrong credentials?")
+            elif response.status_code == 403:
+                logger.warning(f"Access forbidden at {self.ip} (403 Forbidden) - Check user permissions")
+            else:
+                logger.warning(f"Unexpected response from {self.ip}: {response.status_code}")
+        except requests.exceptions.ConnectTimeout:
+            logger.warning(f"Connection timeout to {self.ip} - Camera may be slow or unreachable")
+        except requests.exceptions.ConnectionError as e:
+            logger.warning(f"Connection error to {self.ip}: {str(e)[:100]}")
         except Exception as e:
-            logger.error(f"Failed to get MAC for {self.ip}: {e}")
+            logger.warning(f"Failed to get MAC from {self.ip}: {type(e).__name__}: {str(e)[:100]}")
         return None
     
     def setup_initial_password(self, password: str = "pass") -> bool:
@@ -146,7 +166,8 @@ class AxisCamera:
         """
         try:
             # Try to access without auth to see if in initial setup mode
-            response = requests.get(f"http://{self.ip}/", timeout=5)
+            # Disable proxy for direct camera connection
+            response = requests.get(f"http://{self.ip}/", timeout=5, proxies={'http': None, 'https': None})
             
             # Check if redirected to password setup page
             if 'pwdroot' in response.url.lower() or 'pwdRoot' in response.text:
@@ -162,7 +183,7 @@ class AxisCamera:
                     'rpwd': password  # Confirm password
                 }
                 
-                response = requests.post(setup_url, data=data, timeout=10)
+                response = requests.post(setup_url, data=data, timeout=10, proxies={'http': None, 'https': None})
                 
                 if response.status_code == 200:
                     logger.info(f"Initial password set successfully for {self.ip}")
@@ -743,6 +764,8 @@ def discover_cameras_on_network(configs: List[Dict] = None) -> List[Dict]:
     discovered_macs = set()  # Track MACs to avoid duplicates
     
     logger.info("Starting camera discovery across all network interfaces...")
+    logger.info("Proxy bypass is ENABLED for direct camera connections (fixes corporate laptop issues)")
+    
     
     # Extract target MACs from configs
     target_macs = []
@@ -773,7 +796,7 @@ def discover_cameras_on_network(configs: List[Dict] = None) -> List[Dict]:
         logger.debug(f"Attempting to connect to {DEFAULT_IP} with factory credentials...")
         
         # Try initial password setup if needed (factory-fresh cameras)
-        camera.setup_initial_password("pass")
+        camera.setup_initial_password(FACTORY_INITIAL_PASSWORD)
         
         # Try to get MAC address directly
         mac = camera.get_mac_address()
@@ -848,7 +871,7 @@ def discover_cameras_on_network(configs: List[Dict] = None) -> List[Dict]:
                 try:
                     logger.debug(f"  Trying {ip} with factory credentials...")
                     camera = AxisCamera(ip, "", "root", "")
-                    camera.setup_initial_password("pass")
+                    camera.setup_initial_password(FACTORY_INITIAL_PASSWORD)
                     mac = camera.get_mac_address()
                     
                     if mac and mac not in discovered_macs:
@@ -951,14 +974,14 @@ def discover_cameras_on_network(configs: List[Dict] = None) -> List[Dict]:
                 
                 try:
                     # Try 1: Factory default credentials (root with empty password)
-                    logger.debug(f"  Trying {ip} ({mac}) with factory credentials...")
+                    logger.info(f"  Attempting {ip} ({mac}) with factory credentials (root/empty)...")
                     camera = AxisCamera(ip, mac, "root", "")
-                    camera.setup_initial_password("pass")  # Handle factory-fresh cameras
+                    camera.setup_initial_password(FACTORY_INITIAL_PASSWORD)  # Handle factory-fresh cameras
                     camera_mac = camera.get_mac_address()
                     
                     if camera_mac and camera_mac == mac:
                         auth_method = 'factory'
-                        logger.info(f"  [OK] Found camera at {ip} with MAC {mac} (factory credentials)")
+                        logger.info(f"  ✓ SUCCESS: Camera at {ip} authenticated with factory credentials")
                     else:
                         camera = None
                 except Exception as e:
@@ -968,18 +991,22 @@ def discover_cameras_on_network(configs: List[Dict] = None) -> List[Dict]:
                 # Try 2: CSV credentials (for already-programmed cameras)
                 if not camera and cfg:
                     try:
-                        logger.debug(f"  Trying {ip} ({mac}) with CSV credentials ({csv_username})...")
+                        logger.info(f"  Attempting {ip} ({mac}) with CSV credentials (user: {csv_username})...")
                         camera = AxisCamera(ip, mac, csv_username, csv_password)
                         camera_mac = camera.get_mac_address()
                         
                         if camera_mac and camera_mac == mac:
                             auth_method = 'csv_credentials'
-                            logger.info(f"  [OK] Found camera at {ip} with MAC {mac} (CSV credentials)")
+                            logger.info(f"  ✓ SUCCESS: Camera at {ip} authenticated with CSV credentials")
                         else:
                             camera = None
                     except Exception as e:
                         logger.debug(f"  CSV credentials failed: {e}")
                         camera = None
+                
+                # Log failure for this device
+                if not camera:
+                    logger.warning(f"  ✗ FAILED: Could not authenticate to {ip} ({mac}) - Check credentials in CSV")
                 
                 # If we successfully connected, add to discovered list
                 if camera:
@@ -994,6 +1021,9 @@ def discover_cameras_on_network(configs: List[Dict] = None) -> List[Dict]:
                     discovered_macs.add(mac)
                 else:
                     logger.debug(f"  Not a camera or auth failed: {ip} ({mac})")
+                
+                # Small delay between connection attempts to avoid rate limiting on managed switches
+                time.sleep(0.5)
             
         except Exception as e:
             logger.error(f"Error during ARP discovery on {interface_name}: {e}")
