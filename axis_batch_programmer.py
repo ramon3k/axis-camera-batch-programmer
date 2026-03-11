@@ -19,6 +19,7 @@ import psutil
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import subprocess
 import re
+from urllib.parse import quote
 
 # Configure logging with UTF-8 encoding for Windows compatibility
 import sys
@@ -107,13 +108,16 @@ def convert_timezone(tz_name: str) -> str:
     """Convert common timezone name to POSIX format.
     
     Args:
-        tz_name: Timezone name (e.g., "America/New_York", "Eastern")
+        tz_name: Timezone name (e.g., "America/New_York", "Eastern", "America/Denver (GMT -6)")
     
     Returns:
         POSIX timezone string (e.g., "EST5EDT,M3.2.0,M11.1.0")
         If not found in map, returns input as-is (assumes already POSIX format)
     """
-    return TIMEZONE_MAP.get(tz_name, tz_name)
+    # Strip any GMT offset information in parentheses (e.g., "America/Denver (GMT -6)" -> "America/Denver")
+    tz_name_clean = re.sub(r'\s*\([^)]*\)\s*', '', tz_name).strip()
+    
+    return TIMEZONE_MAP.get(tz_name_clean, tz_name_clean)
 
 
 class AxisCamera:
@@ -520,8 +524,9 @@ class AxisCamera:
             posix_tz = convert_timezone(timezone)
             logger.info(f"Setting timezone '{timezone}' (POSIX: {posix_tz}) for {self.mac}")
             
-            # Set POSIX timezone
-            param_string = f"action=update&root.Time.POSIXTimeZone={posix_tz}"
+            # Set POSIX timezone - URL encode the timezone string to handle special characters
+            posix_tz_encoded = quote(posix_tz, safe='')
+            param_string = f"action=update&root.Time.POSIXTimeZone={posix_tz_encoded}"
             response = self.session.get(url + "?" + param_string, timeout=VAPIX_TIMEOUT)
             
             if response.status_code != 200 or "Error" in response.text:
