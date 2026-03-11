@@ -69,6 +69,7 @@ class AxisBatchProgrammerGUI:
         
         # State
         self.csv_filename = "camera_config.csv"
+        self.firmware_file = None
         self.configs = []
         self.is_running = False
         self.status_queue = queue.Queue()
@@ -266,6 +267,36 @@ class AxisBatchProgrammerGUI:
             width=15
         ).pack(side=tk.LEFT)
         
+        # Firmware upgrade section
+        firmware_frame = ttk.Frame(button_frame)
+        firmware_frame.pack(side=tk.LEFT, padx=(20, 0))
+        
+        self.firmware_var = tk.BooleanVar(value=False)
+        self.firmware_check = ttk.Checkbutton(
+            firmware_frame,
+            text="Upgrade Firmware",
+            variable=self.firmware_var,
+            command=self.toggle_firmware
+        )
+        self.firmware_check.pack(side=tk.LEFT, padx=(0, 5))
+        
+        self.firmware_button = ttk.Button(
+            firmware_frame,
+            text="Select .bin File...",
+            command=self.select_firmware,
+            state=tk.DISABLED,
+            width=15
+        )
+        self.firmware_button.pack(side=tk.LEFT)
+        
+        self.firmware_label = ttk.Label(
+            firmware_frame,
+            text="No firmware selected",
+            style='Status.TLabel',
+            foreground='gray'
+        )
+        self.firmware_label.pack(side=tk.LEFT, padx=(5, 0))
+        
         # Status bar
         self.status_bar = ttk.Label(
             button_frame,
@@ -400,8 +431,31 @@ class AxisBatchProgrammerGUI:
         """Clear the log output."""
         self.log_text.configure(state='normal')
         self.log_text.delete(1.0, tk.END)
-        self.log_text.configure(state='disabled')
+        self.log_text.configure(state='disabled')    
+    def toggle_firmware(self):
+        """Enable/disable firmware file selection based on checkbox."""
+        if self.firmware_var.get():
+            self.firmware_button.config(state=tk.NORMAL)
+        else:
+            self.firmware_button.config(state=tk.DISABLED)
+            self.firmware_file = None
+            self.firmware_label.config(text="No firmware selected", foreground='gray')
+    
+    def select_firmware(self):
+        """Open file dialog to select firmware .bin file."""
+        filename = filedialog.askopenfilename(
+            title="Select Firmware Binary File",
+            filetypes=[(".bin files", "*.bin"), ("All files", "*.*")],
+            initialdir=Path.cwd()
+        )
         
+        if filename:
+            self.firmware_file = filename
+            self.firmware_label.config(
+                text=Path(filename).name,
+                foreground='green'
+            )
+            logging.getLogger('axis_programmer').info(f"Firmware file selected: {Path(filename).name}")        
     def start_programming(self):
         """Start the batch programming process in a background thread."""
         if self.is_running:
@@ -434,6 +488,8 @@ class AxisBatchProgrammerGUI:
         self.scan_button.config(state=tk.DISABLED)
         self.test_button.config(state=tk.DISABLED)
         self.stop_button.config(state=tk.NORMAL)
+        self.firmware_check.config(state=tk.DISABLED)
+        self.firmware_button.config(state=tk.DISABLED)
         self.update_status_bar("Starting batch programming...")
         
         # Start worker thread
@@ -475,6 +531,8 @@ class AxisBatchProgrammerGUI:
         self.scan_button.config(state=tk.DISABLED)
         self.test_button.config(state=tk.DISABLED)
         self.stop_button.config(state=tk.NORMAL)
+        self.firmware_check.config(state=tk.DISABLED)
+        self.firmware_button.config(state=tk.DISABLED)
         self.update_status_bar("Scanning for cameras...")
         
         # Start scan worker thread
@@ -566,11 +624,96 @@ class AxisBatchProgrammerGUI:
                 result = configure_camera(cam_info['camera'], config, self.csv_filename)
                 
                 if result:
+                    # Firmware upgrade (if enabled) - happens AFTER standard configuration
+                    if self.firmware_var.get() and self.firmware_file:
+                        self.status_queue.put({
+                            'mac': mac,
+                            'status': 'Upgrading',
+                            'message': 'Upgrading firmware...'
+                        })
+                        
+                        self.status_queue.put({
+                            'status_bar': f'Upgrading firmware on {mac}... ({success_count + failed_count + 1}/{len(discovered)})'
+                        })
+                        
+                        logger.info(f"\n{'='*70}")
+                        logger.info(f"Firmware Upgrade: {mac}")
+                        logger.info(f"{'='*70}")
+                        
+                        # Create progress callback that updates status_queue
+                        def firmware_progress(stage, message):
+                            self.status_queue.put({
+                                'mac': mac,
+                                'message': f'Firmware: {message}'
+                            })
+                        
+                        try:
+                            firmware_success = cam_info['camera'].upgrade_firmware(
+                                self.firmware_file, 
+                                progress_callback=firmware_progress
+                            )
+                            
+                            if firmware_success:
+                                logger.info(f"✓ Firmware upgrade successful for {mac}")
+                                self.status_queue.put({
+                                    'mac': mac,
+                                    'message': 'Firmware upgraded, reconfiguring network...'
+                                })
+                                
+                                # Firmware upgrade may have changed camera IP to DHCP
+                                # Reconfigure network back to desired static IP from CSV
+                                if config['new_ip'] and 'camera' in cam_info:
+                                    camera = cam_info['camera']
+                                    logger.info(f"Reconfiguring network after firmware upgrade: {camera.ip} → {config['new_ip']}")
+                                    
+                                    try:
+                                        net_success = camera.set_network_config(
+                                            config['new_ip'],
+                                            config.get('subnet_mask', '255.255.255.0'),
+                                            config.get('gateway')
+                                        )
+                                        
+                                        if net_success:
+                                            logger.info(f"✓ Network reconfigured successfully after firmware upgrade")
+                                            self.status_queue.put({
+                                                'mac': mac,
+                                                'message': 'Firmware upgraded and network reconfigured'
+                                            })
+                                        else:
+                                            logger.warning(f"⚠ Network reconfiguration failed but firmware upgraded")
+                                            self.status_queue.put({
+                                                'mac': mac,
+                                                'message': 'Firmware upgraded, manual network config needed'
+                                            })
+                                    except Exception as net_err:
+                                        logger.warning(f"⚠ Network reconfiguration error: {net_err}")
+                                        self.status_queue.put({
+                                            'mac': mac,
+                                            'message': 'Firmware upgraded, network reconfig error'
+                                        })
+                                else:
+                                    self.status_queue.put({
+                                        'mac': mac,
+                                        'message': 'Firmware upgraded successfully'
+                                    })
+                            else:
+                                logger.warning(f"✗ Firmware upgrade failed for {mac}")
+                                self.status_queue.put({
+                                    'mac': mac,
+                                    'message': 'Configuration OK, firmware upgrade failed - see log'
+                                })
+                        except Exception as fw_error:
+                            logger.error(f"✗ Firmware upgrade error for {mac}: {fw_error}", exc_info=True)
+                            self.status_queue.put({
+                                'mac': mac,
+                                'message': f'Configuration OK, firmware error: {fw_error}'
+                            })
+                    
                     success_count += 1
                     self.status_queue.put({
                         'mac': mac,
                         'status': 'Completed',
-                        'message': 'Successfully configured'
+                        'message': 'Successfully configured' + (' and upgraded' if self.firmware_var.get() and self.firmware_file else '')
                     })
                 else:
                     failed_count += 1
@@ -604,6 +747,9 @@ class AxisBatchProgrammerGUI:
                 self.scan_button.config(state=tk.NORMAL)
                 self.test_button.config(state=tk.NORMAL)
                 self.stop_button.config(state=tk.DISABLED)
+                self.firmware_check.config(state=tk.NORMAL)
+                if self.firmware_var.get():
+                    self.firmware_button.config(state=tk.NORMAL)
             
             self.root.after(0, reset_ui)
     
@@ -690,6 +836,9 @@ class AxisBatchProgrammerGUI:
                 self.scan_button.config(state=tk.NORMAL)
                 self.test_button.config(state=tk.NORMAL)
                 self.stop_button.config(state=tk.DISABLED)
+                self.firmware_check.config(state=tk.NORMAL)
+                if self.firmware_var.get():
+                    self.firmware_button.config(state=tk.NORMAL)
             
             self.root.after(0, reset_ui)
     
@@ -720,6 +869,8 @@ class AxisBatchProgrammerGUI:
         self.scan_button.config(state=tk.DISABLED)
         self.test_button.config(state=tk.DISABLED)
         self.stop_button.config(state=tk.NORMAL)
+        self.firmware_check.config(state=tk.DISABLED)
+        self.firmware_button.config(state=tk.DISABLED)
         self.update_status_bar("Testing camera compatibility...")
         
         # Start test worker thread
@@ -818,6 +969,9 @@ class AxisBatchProgrammerGUI:
                 self.scan_button.config(state=tk.NORMAL)
                 self.test_button.config(state=tk.NORMAL)
                 self.stop_button.config(state=tk.DISABLED)
+                self.firmware_check.config(state=tk.NORMAL)
+                if self.firmware_var.get():
+                    self.firmware_button.config(state=tk.NORMAL)
             
             self.root.after(0, reset_ui)
     

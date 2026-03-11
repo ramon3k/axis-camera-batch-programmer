@@ -6,6 +6,8 @@ A Python tool to batch configure Axis network cameras from factory defaults. Han
 
 - ✓ **Automatically scans all active network interfaces** (handles multiple NICs)
 - ✓ **Smart ARP-based discovery** - only connects to IPs with matching MACs
+- ✓ **Flexible MAC address formats** - accepts colons, dashes, or no separators (B8:A4:4F:FF:2E:D7, B8-A4-4F-FF-2E-D7, or B8A44FFF2ED7)
+- ✓ **Firmware upgrade/downgrade** - automated firmware updates with progress tracking
 - ✓ **Handles factory-fresh cameras** - automatically sets initial password
 - ✓ Discovers cameras on network (DHCP or static, even with duplicate default IPs)
 - ✓ Matches cameras by MAC address to configuration spreadsheet
@@ -84,7 +86,7 @@ Edit `camera_config.csv` with your camera details:
 
 | Column | Description | Example |
 |--------|-------------|---------|
-| **MAC_Address** | Camera MAC address (any format) | `00:40:8C:12:34:56` or `00-40-8C-12-34-56` |
+| **MAC_Address** | Camera MAC address (any format) | `00:40:8C:12:34:56` or `00-40-8C-12-34-56` or `0040-8C12-3456` or `00408C123456` |
 | **New_IP** | Desired IP address | `192.168.1.101` || **Subnet_Mask** | Subnet mask for camera | `255.255.255.0` |
 | **Gateway** | Default gateway/router IP (optional) | `192.168.1.1` or leave blank || **Username** | New admin username | `admin` |
 | **Password** | New admin password | `SecurePass123` |
@@ -130,6 +132,15 @@ You can also use POSIX timezone format directly (e.g., `EST5EDT,M3.2.0,M11.1.0`)
 **After initial discovery:**
 The program will log all discovered MACs so you can add them to your CSV.
 
+**MAC Address Format:**
+The program accepts MAC addresses in any of these formats:
+- `B8:A4:4F:FF:2E:D7` (colon-separated - most common)
+- `B8-A4-4F-FF-2E-D7` (dash-separated - Windows ARP format)
+- `B8A44FFF2ED7` (no separators - camera label format)
+- `b8:a4:4f:ff:2e:d7` (lowercase - works too)
+
+All formats are automatically normalized internally for matching.
+
 ### Example CSV
 ```csv
 MAC_Address,New_IP,Subnet_Mask,Gateway,Username,Password,Camera_Name,Timezone,Status,Message,Timestamp
@@ -139,6 +150,40 @@ MAC_Address,New_IP,Subnet_Mask,Gateway,Username,Password,Camera_Name,Timezone,St
 ```
 
 ## Usage
+
+### GUI Mode (Recommended)
+
+1. **Launch the GUI:**
+   ```powershell
+   python axis_batch_programmer_gui.py
+   ```
+
+2. **Load Configuration:**
+   - Click "Browse..." to select your CSV file (`camera_config.csv`)
+   - Review the camera list in the table
+
+3. **(Optional) Enable Firmware Upgrade:**
+   - Check "Upgrade Firmware" checkbox
+   - Click "Select .bin File..." to choose your firmware file
+   - This will upgrade ALL discovered cameras before configuring them
+   - Uncheck to skip firmware upgrade and only configure settings
+
+4. **Scan or Program:**
+   - **"Scan Only"** - Discover cameras and show their current IPs without programming
+   - **"Start Programming"** - Discover and configure all cameras (with optional firmware upgrade)
+   - **"Test Cameras"** - Test VAPIX compatibility without making changes
+
+5. **Monitor Progress:**
+   - Watch status updates in the camera table
+   - View detailed logs in the log output panel
+   - Status bar shows overall progress
+
+6. **Review Results:**
+   - Check Status column: "Completed" (success) or "Failed" (error)
+   - Review Message column for details
+   - CSV file is automatically updated with results
+
+### Command-Line Mode
 
 1. **Prepare your CSV file:**
    - Edit `camera_config.csv` 
@@ -163,6 +208,96 @@ MAC_Address,New_IP,Subnet_Mask,Gateway,Username,Password,Camera_Name,Timezone,St
    - View console output for real-time status
    - Check `camera_config.csv` for Status column updates
    - Review `axis_programmer.log` for detailed logs
+
+## Firmware Upgrade/Downgrade
+
+The program supports automated firmware upgrades and downgrades for Axis cameras. This feature allows you to:
+- Update cameras to the latest firmware for security patches and new features
+- Downgrade cameras if newer firmware causes compatibility issues
+- Standardize firmware versions across your camera fleet
+
+### Downloading Firmware
+
+1. Visit [Axis Firmware Downloads](https://www.axis.com/support/firmware)
+2. Select your camera model (e.g., "P3267-LV")
+3. Download the `.bin` firmware file
+4. Save to a known location (e.g., same folder as the batch programmer)
+
+### Upgrading a Single Camera
+
+Use the provided example script:
+
+```powershell
+python firmware_upgrade_example.py
+```
+
+**Manual upgrade example:**
+```python
+from axis_batch_programmer import AxisCamera
+
+# Connect to camera
+camera = AxisCamera("192.168.1.168", "B8:A4:4F:FF:2E:D7", "root", "admin")
+
+# Check current firmware
+current_version = camera.get_firmware_version()
+print(f"Current firmware: {current_version}")
+
+# Upgrade firmware (camera will reboot)
+success = camera.upgrade_firmware("AXIS_P3267LV_10_12_240.bin")
+
+if success:
+    new_version = camera.get_firmware_version()
+    print(f"Upgrade successful! New firmware: {new_version}")
+```
+
+### Important Notes
+
+- **Camera will reboot** during firmware upgrade (5-10 minutes downtime)
+- **Don't interrupt** the upgrade process (power loss can brick the camera)
+- **Verify firmware file** matches your camera model exactly
+- **Backup configuration** if possible before upgrading
+- **Test on one camera** before upgrading an entire fleet
+- **Schedule upgrades** during maintenance windows if cameras are in production
+
+### Firmware Compatibility
+
+| Camera Model | Tested Firmware Versions |
+|--------------|-------------------------|
+| P3267-LV     | 9.80.x, 10.12.240       |
+| P3225-LV Mk II | 9.80.132             |
+
+Always verify firmware compatibility on [Axis Support](https://www.axis.com/support) before upgrading.
+
+### Progress Monitoring
+
+The upgrade process provides progress callbacks:
+1. **Validating** - Checking current firmware version
+2. **Uploading** - Transferring firmware file to camera (1-3 minutes for ~100MB file)
+3. **Installing** - Camera installing firmware and rebooting (5-10 minutes)
+4. **Rebooting** - Waiting for camera to come back online
+5. **Complete** - Firmware upgraded successfully
+
+### Troubleshooting Firmware Upgrades
+
+**"Firmware file not found"**
+- Verify the file path is correct
+- Use absolute path if relative path fails
+
+**"Upload failed"**
+- Check camera has enough free space
+- Verify firmware file is not corrupted (re-download if needed)
+- Ensure camera model matches firmware file
+
+**"Timeout waiting for camera"**
+- Camera may take longer than 10 minutes on slow networks
+- Wait an additional 5-10 minutes and check manually
+- Camera may still be upgrading - don't power cycle
+
+**"Camera not responding after upgrade"**
+- Wait at least 15 minutes total before troubleshooting
+- Check camera lights indicate normal operation
+- Try accessing via web browser
+- If camera is bricked, contact Axis support for recovery options
 
 ## Program Workflow
 
@@ -268,6 +403,13 @@ Free to use and modify for your needs.
 
 ## Version History
 
+- **v1.1** (2026-03-11)
+  - ✨ **NEW:** Flexible MAC address format support (handles colons, dashes, or no separators)
+  - ✨ **NEW:** Firmware upgrade/downgrade feature with progress monitoring
+  - ✨ **NEW:** Automatic firmware version detection
+  - 📚 Added firmware upgrade example script and documentation
+  - 🔧 Enhanced MAC address normalization for better CSV compatibility
+  
 - **v1.0** (2026-03-04)
   - Initial release
   - Camera discovery by MAC address

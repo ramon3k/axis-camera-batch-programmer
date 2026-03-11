@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 Axis Camera Batch Programmer
-Discovers Axis cameras on network and configures them based on CSV data.
-Handles multiple cameras with same default IP (192.168.0.90).
+Discovers factory-fresh Axis P3267-LV cameras via DHCP/ARP and configures them based on CSV data.
+Automates initial setup (password, EULA) and batch configuration.
 """
 
 import csv
@@ -10,6 +10,7 @@ import socket
 import requests
 import time
 import ipaddress
+import os
 from datetime import datetime
 from typing import Dict, List, Optional
 from requests.auth import HTTPDigestAuth
@@ -37,7 +38,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Constants
-DEFAULT_IP = "192.168.0.90"
+DEFAULT_IP = "192.168.0.90"  # Older models only - P3267-LV uses DHCP
 DEFAULT_USER = "root"  # Most Axis cameras use "root" (including P3267-LV)
 DEFAULT_PASS = ""  # Factory default has no password
 FACTORY_INITIAL_PASSWORD = "pass"  # Temporary password to set on factory-fresh cameras during discovery
@@ -78,6 +79,30 @@ TIMEZONE_MAP = {
     "Australia/Perth": "AWST-8",
 }
 
+def normalize_mac_address(mac: str) -> str:
+    """Normalize MAC address to consistent format with colons.
+    
+    Handles multiple input formats:
+    - B8:A4:4F:FF:2E:D7 (colon format)
+    - B8-A4-4F-FF-2E-D7 (dash format) 
+    - B8A44FFF2ED7 (no separator)
+    - b8:a4:4f:ff:2e:d7 (lowercase)
+    
+    Returns:
+        MAC in uppercase colon format: "B8:A4:4F:FF:2E:D7"
+    """
+    # Remove all separators and convert to uppercase
+    clean_mac = mac.upper().replace(':', '').replace('-', '').replace('.', '')
+    
+    # Validate length
+    if len(clean_mac) != 12:
+        raise ValueError(f"Invalid MAC address length: {mac}")
+    
+    # Insert colons every 2 characters
+    formatted_mac = ':'.join(clean_mac[i:i+2] for i in range(0, 12, 2))
+    return formatted_mac
+
+
 def convert_timezone(tz_name: str) -> str:
     """Convert common timezone name to POSIX format.
     
@@ -96,7 +121,7 @@ class AxisCamera:
     
     def __init__(self, ip: str, mac: str, username: str = DEFAULT_USER, password: str = DEFAULT_PASS):
         self.ip = ip
-        self.mac = mac.upper().replace('-', ':')
+        self.mac = normalize_mac_address(mac)  # Handles all MAC formats
         self.username = username
         self.password = password
         self.session = requests.Session()
@@ -169,88 +194,133 @@ class AxisCamera:
         via the web setup before API access is allowed. This automates that initial setup.
         
         P3267-LV shows "root" username on initial setup page and requires EULA acceptance.
+        
+        Returns:
+            True if setup was attempted (camera was in setup mode)
+            False if camera not in setup mode (already configured)
         """
         try:
-            # Try to access without auth to see if in initial setup mode
-            # Disable proxy for direct camera connection
-            response = requests.get(f"http://{self.ip}/", timeout=10, proxies={'http': None, 'https': None}, allow_redirects=True)
+            # Try multiple URLs - different firmware versions use different paths
+            # P3225: http://IP/ redirects to setup
+            # P3267: http://IP/camera/index.html is the setup page
+            setup_check_urls = [
+                f"http://{self.ip}/camera/index.html",  # P3267 and newer
+                f"http://{self.ip}/",                    # P3225 and older
+            ]
             
-            logger.debug(f"Initial setup check for {self.ip}: URL={response.url}, status={response.status_code}")
+            response = None
+            for check_url in setup_check_urls:
+                try:
+                    logger.info(f"  Trying setup URL: {check_url}")
+                    response = requests.get(check_url, timeout=10, proxies={'http': None, 'https': None}, allow_redirects=True)
+                    logger.info(f"  Response: status={response.status_code}, length={len(response.text)} bytes, final_url={response.url}")
+                    if response.status_code == 200 and len(response.text) > 200:  # Must be substantial content
+                        logger.info(f"  ✓ Found substantial content at {check_url}")
+                        break
+                    else:
+                        logger.info(f"  ✗ Response too small or wrong status, trying next URL...")
+                except Exception as e:
+                    logger.info(f"  ✗ Request failed: {e}")
+                    continue
             
-            # Check if this is the initial setup page
+            if not response or response.status_code != 200:
+                logger.info(f"  ✗ Could not access any initial setup page for {self.ip}")
+                return False
+            
+            # P3267 firmware uses a JavaScript SPA (single-page app) for setup
+            # The /camera/index.html returns only ~861 bytes of skeleton HTML
+            # All content (passwords, EULA, etc.) is rendered by JavaScript after page load
+            # We can't parse the content, so we detect setup mode by:
+            # 1. If we got /camera/index.html with status 200 and small size, attempt setup
+            # 2. If we got / and it contains setup indicators, attempt setup
+            
             response_text = response.text.lower()
-            is_setup_page = any([
-                'set a password' in response_text,
-                'pwdroot' in response.url.lower(),
-                'setpassword' in response.url.lower(),
-                'add user' in response_text,
-                'end user license agreement' in response_text
-            ])
+            is_spa_setup_page = False
+            is_traditional_setup_page = False
             
-            if is_setup_page:
-                logger.info(f"Camera at {self.ip} requires initial setup (password + EULA)")
+            # Check if this is P3267-style SPA setup page (small HTML skeleton)
+            if '/camera/index.html' in response.url and len(response.text) < 2000:
+                logger.info(f"  Detected P3267 JavaScript SPA setup page (skeleton size: {len(response.text)} bytes)")
+                is_spa_setup_page = True
+            
+            # Check if this is traditional setup page with content indicators
+            indicators = {
+                'set a password': 'set a password' in response_text,
+                'pwdroot in URL': 'pwdroot' in response.url.lower(),
+                'setpassword in URL': 'setpassword' in response.url.lower(),
+                'add user': 'add user' in response_text,
+                'EULA': 'end user license agreement' in response_text,
+            }
+            
+            if any(indicators.values()):
+                logger.info(f"  Detected traditional setup page with content indicators: {indicators}")
+                is_traditional_setup_page = True
+            
+            is_setup_page = is_spa_setup_page or is_traditional_setup_page
+            
+            if not is_setup_page:
+                # Camera not in initial setup mode - already configured
+                logger.info(f"  ✗ Camera at {self.ip} not in initial setup mode")
+                return False
+            
+            logger.info(f"Camera at {self.ip} IS in initial setup mode - attempting automation...")
+            
+            # P3267 firmware 10.12.240+ uses pwdgrp.cgi with GET method and Digest auth
+            # Discovery via browser DevTools: GET /axis-cgi/pwdgrp.cgi?action=add&user=root&pwd={password}&grp=root&sgrp=admin:operator:viewer:ptz
+            
+            username = 'root'
+            logger.info(f"  Setting up initial user '{username}' with password...")
+            
+            # Create a temporary session with the NEW password for Digest auth
+            # P3267 accepts Digest auth with the password being set during initial setup
+            temp_session = requests.Session()
+            temp_session.auth = HTTPDigestAuth(username, password)
+            temp_session.trust_env = False
+            temp_session.proxies = {'http': None, 'https': None}
+            
+            # Build the pwdgrp.cgi URL with parameters
+            # action=add: Create new user
+            # user=root: Username
+            # pwd={password}: Password to set
+            # grp=root: Primary group
+            # sgrp=admin:operator:viewer:ptz: Secondary groups (full permissions)
+            setup_url = (
+                f"http://{self.ip}/axis-cgi/pwdgrp.cgi?"
+                f"action=add&user={username}&pwd={password}&grp=root&sgrp=admin:operator:viewer:ptz"
+            )
+            
+            try:
+                logger.info(f"  GET request to: {setup_url.replace(f'pwd={password}', 'pwd=****')}")
+                response = temp_session.get(setup_url, timeout=15, allow_redirects=False)
                 
-                # P3267-LV and newer cameras use this form structure
-                setup_url = f"http://{self.ip}/axis-cgi/pwdroot.cgi"
+                logger.info(f"  Response: status={response.status_code}, Content-Type={response.headers.get('Content-Type', 'unknown')}")
+                logger.info(f"  Response body: {response.text[:200]}")
                 
-                # Try multiple username variations (P3267-LV uses 'root', but try others too)
-                for username in ['root', 'admin']:
-                    # Form data matching the screenshot: password fields + EULA acceptance
-                    form_data = {
-                        'user': username,
-                        'pwd': password,
-                        'rpwd': password,  # Repeat password
-                        'accept': 'yes',   # EULA acceptance
-                        'termsaccepted': 'yes',  # Alternative EULA field
-                    }
+                # Success indicators: 200 OK, or response contains "OK" or "Created account"
+                if response.status_code == 200 and ('ok' in response.text.lower() or 'created' in response.text.lower() or len(response.text.strip()) == 0):
+                    logger.info(f"  ✓ Password set successfully for {self.ip} (username: {username})")
                     
-                    try:
-                        logger.info(f"Attempting initial setup for {self.ip} with username '{username}'...")
-                        response = requests.post(
-                            setup_url, 
-                            data=form_data, 
-                            timeout=15, 
-                            proxies={'http': None, 'https': None},
-                            allow_redirects=False  # Don't follow redirects to see actual response
-                        )
-                        
-                        logger.debug(f"Setup response: status={response.status_code}, text={response.text[:200]}")
-                        
-                        # Success indicators: 200 OK, redirect (302/303), or "OK" in response
-                        if response.status_code in [200, 302, 303] or 'ok' in response.text.lower():
-                            logger.info(f"✓ Initial password set successfully for {self.ip} (username: {username})")
-                            
-                            # Update our session with the new credentials
-                            self.username = username
-                            self.password = password
-                            self.session.auth = HTTPDigestAuth(username, password)
-                            
-                            time.sleep(3)  # Give camera time to complete setup and reboot if needed
-                            return True
-                        else:
-                            logger.debug(f"Setup with '{username}' returned status {response.status_code}")
-                            
-                    except Exception as e:
-                        logger.debug(f"Setup attempt with '{username}' failed: {e}")
-                        continue
-                
-                # If we got here, setup may have worked but response was unclear
-                # Try assuming 'root' worked (most common for P3267-LV)
-                logger.warning(f"Initial setup response unclear, assuming 'root' credentials")
-                self.username = 'root'
-                self.password = password
-                self.session.auth = HTTPDigestAuth('root', password)
-                time.sleep(3)
-                return True
+                    # Update our session with the new credentials
+                    self.username = username
+                    self.password = password
+                    self.session.auth = HTTPDigestAuth(username, password)
+                    
+                    return True
+                else:
+                    logger.warning(f"  ✗ Setup request returned unexpected response")
+                    logger.warning(f"  Status: {response.status_code}, Body: {response.text[:500]}")
+                    
+            except Exception as e:
+                logger.warning(f"  ✗ Setup request failed: {e}")
             
-            # Camera not in initial setup mode - already configured
-            logger.debug(f"Camera at {self.ip} not in initial setup mode")
-            return True
+            # If we got here, all setup attempts failed
+            logger.warning(f"All initial setup attempts failed for {self.ip}")
+            logger.warning(f"Camera requires MANUAL web setup: http://{self.ip}/")
+            return True  # Setup was needed but automation failed
             
         except Exception as e:
-            logger.warning(f"Error during initial password setup: {e}")
-            # Don't fail - camera might already be set up
-            return True
+            logger.warning(f"Error during initial password setup check: {e}")
+            return False  # Couldn't determine setup status
     
     def set_network_config(self, new_ip: str, subnet_mask: str = "255.255.255.0", gateway: str = None) -> bool:
         """Configure camera's network settings."""
@@ -278,22 +348,52 @@ class AxisCamera:
                 logger.info(f"Setting gateway to {gateway} for {self.mac}")
             
             # Use GET request - Axis VAPIX often works better with GET for param updates
-            response = self.session.get(url + "?" + param_string, timeout=VAPIX_TIMEOUT)
-            
-            # Note: 401 response with "OK" text often means the change was applied
-            # but the connection was interrupted due to network change
-            if response.status_code == 200 or (response.status_code == 401 and response.text.strip() == "OK"):
-                logger.info(f"Network config set for {self.mac}: {new_ip}")
-                # Update our IP for further communication
+            try:
+                response = self.session.get(url + "?" + param_string, timeout=VAPIX_TIMEOUT)
+                
+                # Note: 401 response with "OK" text often means the change was applied
+                # but the connection was interrupted due to network change
+                if response.status_code == 200 or (response.status_code == 401 and response.text.strip() == "OK"):
+                    logger.info(f"Network config set for {self.mac}: {new_ip}")
+                    # Update our IP for further communication
+                    self.ip = new_ip
+                    time.sleep(5)  # Wait longer for camera to apply network settings
+                    return True
+                else:
+                    logger.error(f"Failed to set network config: {response.status_code}")
+                    logger.debug(f"Response: {response.text[:200]}")
+                    return False
+                    
+            except (requests.exceptions.ConnectionError, requests.exceptions.ReadTimeout, ConnectionResetError) as conn_err:
+                # Connection dropped or timed out during IP change - this is NORMAL!
+                # Camera closes connection while reconfiguring network or times out before responding
+                logger.info(f"Connection interrupted during IP change (expected) - waiting for camera to reconfigure...")
+                logger.debug(f"Connection error details: {conn_err}")
+                
+                # Update our IP to the new one and wait for camera to come back online
                 self.ip = new_ip
-                time.sleep(5)  # Wait longer for camera to apply network settings
-                return True
-            else:
-                logger.error(f"Failed to set network config: {response.status_code}")
-                logger.debug(f"Response: {response.text[:200]}")
-                return False
+                time.sleep(8)  # Give camera extra time to apply network changes and reboot
+                
+                # Try to verify the new IP is reachable
+                try:
+                    logger.info(f"Verifying camera is online at new IP {new_ip}...")
+                    test_url = f"http://{new_ip}/axis-cgi/param.cgi?action=list&group=Network.eth0"
+                    test_response = self.session.get(test_url, timeout=VAPIX_TIMEOUT)
+                    
+                    if test_response.status_code == 200:
+                        logger.info(f"✓ Camera successfully reconfigured and online at {new_ip}")
+                        return True
+                    else:
+                        logger.warning(f"Camera responded at {new_ip} but with status {test_response.status_code}")
+                        return True  # Likely still success, camera may just be finalizing setup
+                        
+                except Exception as verify_err:
+                    logger.warning(f"Could not verify new IP {new_ip}: {verify_err}")
+                    logger.info("Camera may still be rebooting - configuration likely succeeded")
+                    return True  # Assume success - verification is flaky after network change
+                    
         except Exception as e:
-            logger.error(f"Error setting network config: {e}")
+            logger.error(f"Unexpected error setting network config: {e}")
             return False
     
     def set_credentials(self, new_username: str, new_password: str) -> bool:
@@ -514,6 +614,301 @@ class AxisCamera:
             logger.error(f"Error verifying configuration: {e}")
             return False
     
+    def get_firmware_version(self) -> Optional[str]:
+        """Get current firmware version.
+        
+        Returns:
+            Firmware version string (e.g., "10.12.240") or None if unable to retrieve
+        """
+        try:
+            url = f"http://{self.ip}/axis-cgi/param.cgi?action=list&group=root.Properties.Firmware"
+            response = self.session.get(url, timeout=VAPIX_TIMEOUT)
+            
+            if response.status_code == 200:
+                for line in response.text.split('\n'):
+                    if 'Version' in line:
+                        version = line.split('=')[1].strip()
+                        logger.info(f"Current firmware version: {version}")
+                        return version
+            
+            logger.warning(f"Could not retrieve firmware version from {self.ip}")
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error getting firmware version: {e}")
+            return None
+    
+    def upgrade_firmware(self, firmware_path: str, progress_callback=None) -> bool:
+        """Upload and install firmware update.
+        
+        Args:
+            firmware_path: Path to .bin firmware file
+            progress_callback: Optional callback function(stage, message) for progress updates
+        
+        Returns:
+            True if upgrade successful, False otherwise
+        """
+        try:
+            if not os.path.exists(firmware_path):
+                logger.error(f"Firmware file not found: {firmware_path}")
+                return False
+            
+            firmware_filename = os.path.basename(firmware_path)
+            logger.info(f"Starting firmware upgrade for {self.mac} using {firmware_filename}")
+            
+            if progress_callback:
+                progress_callback("validating", "Checking current firmware...")
+            
+            current_version = self.get_firmware_version()
+            if current_version:
+                logger.info(f"Current firmware: {current_version}")
+            
+            # Step 1: Upload firmware file
+            if progress_callback:
+                progress_callback("uploading", "Uploading firmware file...")
+            
+            logger.info(f"Uploading firmware file ({os.path.getsize(firmware_path) / 1024 / 1024:.1f} MB)...") 
+            
+            # Try simple binary POST first (works on many Axis cameras)
+            url = f"http://{self.ip}/axis-cgi/firmwaremanagement.cgi?method=upgrade"
+            
+            with open(firmware_path, 'rb') as f:
+                # Send raw binary file as request body
+                headers = {'Content-Type': 'application/octet-stream'}
+                response = self.session.post(url, data=f, headers=headers, timeout=600)
+            
+            logger.info(f"Firmware upload response: HTTP {response.status_code}")
+            logger.info(f"Response content: {response.text[:500]}")  # Changed to INFO to always see it
+            
+            if response.status_code == 200:
+                logger.info("Firmware upload successful")
+                
+                # Check if response contains JSON error (even with 200 status)
+                has_json_error = False
+                try:
+                    response_json = response.json()
+                    if 'error' in response_json:
+                        logger.warning(f"Upload returned error in JSON: {response_json['error'].get('message', 'Unknown error')}")
+                        has_json_error = True
+                except ValueError:
+                    # Not JSON, continue with normal processing
+                    pass
+                
+                if not has_json_error:
+                    if progress_callback:
+                        progress_callback("installing", "Installing firmware (camera will reboot)...")
+                    
+                    # Check response for success indicators
+                    response_text = response.text.lower()
+                    
+                    # VAPIX 3 returns JSON with data field on success
+                    try:
+                        response_json = response.json()
+                        if 'data' in response_json and 'firmwareVersion' in response_json.get('data', {}):
+                            new_fw_version = response_json['data']['firmwareVersion']
+                            logger.info(f"Firmware upgrade accepted! Target version: {new_fw_version}")
+                            logger.info("Camera will reboot - this may take 5-10 minutes")
+                            
+                            if progress_callback:
+                                progress_callback("rebooting", "Waiting for camera to reboot (5-10 minutes)...")
+                            
+                            # Wait for camera to reboot
+                            logger.info("Waiting 2 minutes before checking camera status...")
+                            time.sleep(120)
+                            
+                            # NOTE: Firmware upgrade may change camera IP!
+                            # Camera temporarily enables DHCP during upgrade, gets new IP,
+                            # then converts DHCP address to static. We need to find it by MAC.
+                            original_ip = self.ip
+                            camera_found = False
+                            
+                            # Poll for camera to come back online (up to 10 minutes)
+                            max_attempts = 60
+                            for attempt in range(max_attempts):
+                                try:
+                                    # Try original IP first
+                                    test_response = self.session.get(
+                                        f"http://{self.ip}/axis-cgi/param.cgi?action=list&group=root.Properties.Firmware",
+                                        timeout=10
+                                    )
+                                    
+                                    if test_response.status_code == 200:
+                                        camera_found = True
+                                        break
+                                        
+                                except:
+                                    # Camera not at original IP - it may have moved during firmware upgrade
+                                    if attempt % 6 == 0:  # Every minute
+                                        logger.info(f"Camera not responding at {self.ip}, scanning for new IP...")
+                                        
+                                        # Scan ARP table for camera by MAC address
+                                        try:
+                                            import subprocess
+                                            result = subprocess.run(['arp', '-a'], capture_output=True, text=True, timeout=5)
+                                            
+                                            # Look for our MAC in ARP table
+                                            target_mac_formats = [
+                                                self.mac.replace(':', '-').lower(),  # Windows format
+                                                self.mac.lower(),  # Colon format
+                                            ]
+                                            
+                                            for line in result.stdout.split('\n'):
+                                                for mac_format in target_mac_formats:
+                                                    if mac_format in line.lower():
+                                                        # Extract IP from line
+                                                        parts = line.split()
+                                                        if len(parts) >= 1:
+                                                            potential_ip = parts[0].strip()
+                                                            if potential_ip != self.ip and '.' in potential_ip:
+                                                                logger.info(f"Found camera at new IP: {potential_ip} (was {self.ip})")
+                                                                self.ip = potential_ip
+                                                                break
+                                        except:
+                                            pass
+                                
+                                if attempt % 6 == 0:  # Log every minute
+                                    logger.info(f"Still waiting for camera to come online... ({attempt * 10}s elapsed)")
+                                
+                                time.sleep(10)
+                            
+                            if camera_found:
+                                # Camera is back online - verify new firmware
+                                new_version = self.get_firmware_version()
+                                
+                                if progress_callback:
+                                    progress_callback("complete", f"Firmware upgrade complete: {new_version}")
+                                
+                                logger.info(f"✓ Firmware upgrade successful!")
+                                logger.info(f"  Old version: {current_version}")
+                                logger.info(f"  New version: {new_version}")
+                                if self.ip != original_ip:
+                                    logger.warning(f"  Camera IP changed during upgrade: {original_ip} → {self.ip}")
+                                return True
+                            else:
+                                logger.error("Timeout waiting for camera to come back online after firmware upgrade")
+                                logger.warning("Camera may still be upgrading - check manually after a few minutes")
+                                return False
+                    except ValueError:
+                        pass  # Not JSON, continue checking text
+                    
+                    # Fallback: Check for text-based success indicators
+                    if 'ok' in response_text or 'success' in response_text:
+                        logger.info("Firmware upgrade initiated - camera will reboot")
+                        logger.info("This may take 5-10 minutes. Camera will be unavailable during upgrade.")
+                        
+                        if progress_callback:
+                            progress_callback("rebooting", "Waiting for camera to reboot (5-10 minutes)...")
+                        
+                        # Wait for camera to reboot and come back online
+                        logger.info("Waiting 2 minutes before checking camera status...")
+                        time.sleep(120)
+                        
+                        # Poll for camera to come back online (up to 10 minutes)
+                        max_attempts = 60  # 10 minutes (10 second intervals)
+                        for attempt in range(max_attempts):
+                            try:
+                                test_response = self.session.get(
+                                    f"http://{self.ip}/axis-cgi/param.cgi?action=list&group=root.Properties.Firmware",
+                                    timeout=10
+                                )
+                                
+                                if test_response.status_code == 200:
+                                    # Camera is back online - verify new firmware
+                                    new_version = self.get_firmware_version()
+                                    
+                                    if progress_callback:
+                                        progress_callback("complete", f"Firmware upgrade complete: {new_version}")
+                                    
+                                    logger.info(f"✓ Firmware upgrade successful!")
+                                    logger.info(f"  Old version: {current_version}")
+                                    logger.info(f"  New version: {new_version}")
+                                    return True
+                                    
+                            except:
+                                pass  # Camera still rebooting
+                            
+                            if attempt % 6 == 0:  # Log every minute
+                                logger.info(f"Still waiting for camera to come online... ({attempt * 10}s elapsed)")
+                            
+                            time.sleep(10)
+                        
+                        logger.error("Timeout waiting for camera to come back online after firmware upgrade")
+                        logger.warning("Camera may still be upgrading - check manually after a few minutes")
+                        return False
+                    else:
+                        logger.warning(f"Unexpected response from firmware upgrade: {response.text[:200]}")
+                        # Fall through to legacy method
+                else:
+                    logger.info("Modern API returned error - will try legacy method")
+                    # Fall through to legacy method
+            
+            # If we get here, try legacy method (either status != 200 or unexpected response)
+            if response.status_code != 200:
+                logger.error(f"Firmware upload failed: HTTP {response.status_code}")
+                logger.debug(f"Response: {response.text[:200]}")
+            
+            # Try older upgrade method for compatibility
+            logger.info("Trying legacy upgrade method...")
+            url = f"http://{self.ip}/axis-cgi/admin/upgrade.cgi"
+            
+            with open(firmware_path, 'rb') as f:
+                files = {'file': (firmware_filename, f, 'application/octet-stream')}
+                response = self.session.post(url, files=files, timeout=600)
+            
+            if response.status_code == 200:
+                logger.info("Firmware upload successful (legacy method)")
+                logger.info("Firmware upgrade initiated - camera will reboot")
+                logger.info("This may take 5-10 minutes. Camera will be unavailable during upgrade.")
+                
+                if progress_callback:
+                    progress_callback("rebooting", "Waiting for camera to reboot (5-10 minutes)...")
+                
+                # Wait for camera to reboot
+                logger.info("Waiting 2 minutes before checking camera status...")
+                time.sleep(120)
+                
+                # Poll for camera to come back online
+                max_attempts = 60
+                for attempt in range(max_attempts):
+                    try:
+                        test_response = self.session.get(
+                            f"http://{self.ip}/axis-cgi/param.cgi?action=list&group=root.Properties.Firmware",
+                            timeout=10
+                        )
+                        
+                        if test_response.status_code == 200:
+                            new_version = self.get_firmware_version()
+                            
+                            if progress_callback:
+                                progress_callback("complete", f"Firmware upgrade complete: {new_version}")
+                            
+                            logger.info(f"✓ Firmware upgrade successful!")
+                            logger.info(f"  Old version: {current_version}")
+                            logger.info(f"  New version: {new_version}")
+                            return True
+                            
+                    except:
+                        pass
+                    
+                    if attempt % 6 == 0:
+                        logger.info(f"Still waiting for camera to come online... ({attempt * 10}s elapsed)")
+                    
+                    time.sleep(10)
+                
+                logger.error("Timeout waiting for camera after legacy upgrade")
+                return False
+            else:
+                logger.error(f"Legacy firmware upload also failed: HTTP {response.status_code}")
+                if response.status_code == 404:
+                    logger.error("Legacy upgrade endpoint not available on this firmware version")
+                    logger.error("This camera requires the modern firmwaremanagement.cgi API")
+                logger.debug(f"Response: {response.text[:200]}")
+                return False
+                    
+        except Exception as e:
+            logger.error(f"Error during firmware upgrade: {e}")
+            return False
+    
     def test_compatibility(self) -> Dict[str, any]:
         """Test camera compatibility without making changes.
         
@@ -705,7 +1100,7 @@ def get_arp_table() -> Dict[str, str]:
                 match = re.search(r'(\d+\.\d+\.\d+\.\d+)\s+([0-9a-fA-F-]{17})', line)
                 if match:
                     ip = match.group(1)
-                    mac = match.group(2).upper().replace('-', ':')
+                    mac = normalize_mac_address(match.group(2))
                     arp_table[mac] = ip
         else:
             # Linux/Mac: use 'arp -n'
@@ -717,7 +1112,7 @@ def get_arp_table() -> Dict[str, str]:
                 match = re.search(r'(\d+\.\d+\.\d+\.\d+).*?([0-9a-fA-F:]{17})', line)
                 if match:
                     ip = match.group(1)
-                    mac = match.group(2).upper()
+                    mac = normalize_mac_address(match.group(2))
                     arp_table[mac] = ip
         
         logger.info(f"Found {len(arp_table)} devices in ARP table")
@@ -812,12 +1207,12 @@ def discover_cameras_on_network(configs: List[Dict] = None) -> List[Dict]:
     logger.info("Proxy bypass is ENABLED for direct camera connections (fixes corporate laptop issues)")
     
     
-    # Extract target MACs from configs
+    # Extract target MACs from configs and normalize them
     target_macs = []
     config_by_mac = {}
     if configs:
         for cfg in configs:
-            mac = cfg['mac']
+            mac = normalize_mac_address(cfg['mac'])  # Normalize MAC from CSV
             target_macs.append(mac)
             config_by_mac[mac] = cfg
         logger.info(f"Searching for {len(target_macs)} specific camera MAC(s) from CSV")
@@ -830,19 +1225,14 @@ def discover_cameras_on_network(configs: List[Dict] = None) -> List[Dict]:
         return discovered
     
     logger.info(f"Scanning {len(interfaces)} active network interface(s)...\n")
-    logger.info("Note: Skipping 192.168.0.90 scan - factory-reset cameras use DHCP")
-    
-    # Skip Method 1 & 2: Factory-reset cameras are on DHCP, not static 192.168.0.90
-    # This saves time during batch programming where all cameras are factory-defaulted
+    # P3267-LV cameras use DHCP on first boot - no static 192.168.0.90 scanning needed
+    # ARP-based discovery finds cameras at whatever DHCP address they received
     
     # ARP-based discovery for DHCP cameras
     logger.info("\nARP-based discovery (for DHCP factory-reset cameras)...")
     
-    # Normalize target MACs for comparison
-    if target_macs:
-        target_macs_normalized = [mac.upper().replace('-', ':') for mac in target_macs]
-    else:
-        target_macs_normalized = []
+    # Target MACs are already normalized by config processing above
+    target_macs_normalized = target_macs
     
     for interface in interfaces:
         interface_ip = interface['ip']
@@ -892,16 +1282,45 @@ def discover_cameras_on_network(configs: List[Dict] = None) -> List[Dict]:
                 # FIRST: Check if camera is in initial setup mode (factory-fresh)
                 # This must be done BEFORE trying authentication
                 logger.info(f"  Checking if {ip} ({mac}) is in initial setup mode...")
+                setup_success = False
                 try:
                     # Create temporary camera object just for setup check
                     temp_camera = AxisCamera(ip, mac, "root", "")
-                    setup_needed = temp_camera.setup_initial_password(FACTORY_INITIAL_PASSWORD)
+                    setup_result = temp_camera.setup_initial_password(FACTORY_INITIAL_PASSWORD)
                     
-                    if setup_needed:
-                        logger.info(f"  Initial setup completed, camera should now have password '{FACTORY_INITIAL_PASSWORD}'")
-                        time.sleep(2)  # Allow camera to finalize setup
+                    # Verify the setup actually worked by testing authentication
+                    if setup_result:
+                        time.sleep(3)  # Give camera time to complete setup
+                        
+                        # Try to authenticate with the password we just set
+                        logger.debug(f"  Verifying initial setup by testing authentication...")
+                        test_camera = AxisCamera(ip, mac, "root", FACTORY_INITIAL_PASSWORD)
+                        test_mac = test_camera.get_mac_address()
+                        
+                        if test_mac:
+                            logger.info(f"  ✓ Initial setup completed successfully - camera now has root/{FACTORY_INITIAL_PASSWORD}")
+                            setup_success = True
+                        else:
+                            logger.warning(f"  ⚠ Initial setup attempted but verification failed")
+                            logger.warning(f"  Camera may require MANUAL web setup: http://{ip}/")
+                    
                 except Exception as e:
-                    logger.debug(f"  Initial setup check: {e}")
+                    logger.debug(f"  Initial setup check error: {e}")
+                
+                # If setup automation failed, skip trying factory credentials
+                # (camera is still in setup mode and won't respond to API calls)
+                if not setup_success:
+                    # Check if camera is still in setup mode (401 on all requests)
+                    try:
+                        test_url = f"http://{ip}/axis-cgi/param.cgi?action=list&group=Network"
+                        test_resp = requests.get(test_url, timeout=5, proxies={'http': None, 'https': None})
+                        if test_resp.status_code == 401:
+                            logger.error(f"  ✗ Camera at {ip} requires MANUAL initial setup")
+                            logger.error(f"  ACTION REQUIRED: Open http://{ip}/ in browser, accept EULA, set password to '{FACTORY_INITIAL_PASSWORD}'")
+                            logger.error(f"  Then run this program again to configure the camera")
+                            continue  # Skip this camera
+                    except:
+                        pass
                 
                 # NOW: Try factory credentials - different models use different defaults
                 factory_credentials = [
@@ -1004,7 +1423,7 @@ def read_camera_config_csv(filename: str, skip_completed: bool = True) -> List[D
                     continue
                     
                 configs.append({
-                    'mac': row['MAC_Address'].upper().replace('-', ':'),
+                    'mac': normalize_mac_address(row['MAC_Address']),  # Normalize all MAC formats
                     'new_ip': row['New_IP'],
                     'subnet_mask': row.get('Subnet_Mask', '255.255.255.0').strip(),
                     'gateway': row.get('Gateway', '').strip() or None,
@@ -1042,7 +1461,8 @@ def update_csv_status(filename: str, mac: str, status: str, message: str = ""):
                 fieldnames = list(fieldnames) + ['Status', 'Message', 'Timestamp']
             
             for row in reader:
-                if row['MAC_Address'].upper().replace('-', ':') == mac.upper().replace('-', ':'):
+                # Normalize both MACs for comparison to handle all formats
+                if normalize_mac_address(row['MAC_Address']) == normalize_mac_address(mac):
                     row['Status'] = status
                     row['Message'] = message
                     row['Timestamp'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -1171,9 +1591,10 @@ def main():
     if not discovered:
         logger.error("No cameras discovered on network!")
         logger.info("\nTroubleshooting tips:")
-        logger.info("  1. Ensure cameras are powered on and connected")
-        logger.info(f"  2. Verify your computer can reach {DEFAULT_IP}")
-        logger.info("  3. Check that cameras are set to factory defaults")
+        logger.info("  1. Ensure cameras are powered on and connected to network")
+        logger.info("  2. Verify cameras are getting DHCP addresses (P3267-LV doesn't use static 192.168.0.90)")
+        logger.info("  3. Check that camera MAC addresses in CSV match actual camera MACs")
+        logger.info("  4. Try running 'arp -a' to see if camera appears in ARP table")
         return
     
     print(f"\nDiscovered {len(discovered)} camera(s) on network\n")
