@@ -597,16 +597,36 @@ class AxisCamera:
         try:
             url = f"http://{self.ip}/axis-cgi/param.cgi"
             
-            # Set resolution for video stream (Image.I0 is the main video stream)
-            param_string = f"action=update&root.Image.I0.Appearance.Resolution={width}x{height}"
-            response = self.session.get(url + "?" + param_string, timeout=VAPIX_TIMEOUT)
+            # First, query available Image parameters to see what's supported
+            logger.debug("Checking available Image parameters...")
+            list_response = self.session.get(url + "?action=list&group=Image", timeout=VAPIX_TIMEOUT)
+            if list_response.status_code == 200:
+                logger.debug(f"Available Image parameters:\n{list_response.text[:500]}")
             
-            if response.status_code == 200 and "Error" not in response.text:
-                logger.info(f"Resolution set to {width}x{height} for {self.mac}")
-                return True
-            else:
-                logger.warning(f"Resolution setting had issues: {response.text[:100]}")
-                return True  # Don't fail - may not be supported on all models
+            # Try multiple possible parameter names for resolution
+            # Different Axis camera models/firmware use different parameters
+            resolution_params = [
+                f"root.Image.I0.Stream.1.Resolution={width}x{height}",  # Stream-specific
+                f"root.Image.I0.Appearance.Resolution={width}x{height}",  # Appearance setting
+                f"root.Properties.Image.Resolution={width}x{height}",  # Global properties
+                f"root.ImageSource.I0.Sensor.Resolution={width}x{height}",  # Sensor resolution
+            ]
+            
+            for param in resolution_params:
+                param_string = f"action=update&{param}"
+                logger.info(f"Trying resolution parameter: {param}")
+                response = self.session.get(url + "?" + param_string, timeout=VAPIX_TIMEOUT)
+                
+                if response.status_code == 200 and "Error" not in response.text:
+                    logger.info(f"✓ Resolution set to {width}x{height} for {self.mac} using {param.split('=')[0]}")
+                    return True
+                else:
+                    logger.debug(f"Parameter {param.split('=')[0]} didn't work: {response.text[:100]}")
+            
+            # If none worked, log warning but don't fail
+            logger.warning(f"Could not set resolution to {width}x{height} - may not be supported on this model")
+            logger.warning(f"Resolution remains at camera default")
+            return True  # Don't fail - may not be supported on all models
                 
         except Exception as e:
             logger.warning(f"Error setting resolution for {self.mac}: {e}")
