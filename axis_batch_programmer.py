@@ -1542,7 +1542,7 @@ def configure_camera(camera: AxisCamera, config: Dict, csv_filename: str) -> boo
         update_csv_status(csv_filename, mac, 'In Progress', 'Starting configuration')
         
         # Step 1: Set credentials FIRST (while on stable connection at default IP)
-        logger.info(f"Step 1/6: Setting credentials (user: {config['username']})...")
+        logger.info(f"Step 1/7: Setting credentials (user: {config['username']})...")
         if not camera.set_credentials(config['username'], config['password']):
             raise Exception("Failed to set credentials")
         
