@@ -597,31 +597,32 @@ class AxisCamera:
         try:
             url = f"http://{self.ip}/axis-cgi/param.cgi"
             
-            # First, query available Image parameters to see what's supported
-            logger.debug("Checking available Image parameters...")
-            list_response = self.session.get(url + "?action=list&group=Image", timeout=VAPIX_TIMEOUT)
-            if list_response.status_code == 200:
-                logger.debug(f"Available Image parameters:\n{list_response.text[:500]}")
-            
             # Try multiple possible parameter names for resolution
             # Different Axis camera models/firmware use different parameters
+            # P3267-LV confirmed working: root.Image.I0.Appearance.Resolution
             resolution_params = [
+                f"root.Image.I0.Appearance.Resolution={width}x{height}",  # P3267-LV, P3225 (most common)
                 f"root.Image.I0.Stream.1.Resolution={width}x{height}",  # Stream-specific
-                f"root.Image.I0.Appearance.Resolution={width}x{height}",  # Appearance setting
                 f"root.Properties.Image.Resolution={width}x{height}",  # Global properties
                 f"root.ImageSource.I0.Sensor.Resolution={width}x{height}",  # Sensor resolution
             ]
             
             for param in resolution_params:
                 param_string = f"action=update&{param}"
-                logger.info(f"Trying resolution parameter: {param}")
+                logger.info(f"Trying resolution parameter: {param.split('=')[0]}")
                 response = self.session.get(url + "?" + param_string, timeout=VAPIX_TIMEOUT)
                 
-                if response.status_code == 200 and "Error" not in response.text:
-                    logger.info(f"✓ Resolution set to {width}x{height} for {self.mac} using {param.split('=')[0]}")
-                    return True
+                # Success is indicated by HTTP 200 with "OK" response (not containing "Error")
+                if response.status_code == 200:
+                    response_text = response.text.strip()
+                    if response_text == "OK" or (response_text and "error" not in response_text.lower()):
+                        logger.info(f"✓ Resolution set to {width}x{height} for {self.mac}")
+                        logger.info(f"  Used parameter: {param.split('=')[0]}")
+                        return True
+                    else:
+                        logger.debug(f"  Response: {response_text[:100]}")
                 else:
-                    logger.debug(f"Parameter {param.split('=')[0]} didn't work: {response.text[:100]}")
+                    logger.debug(f"  HTTP {response.status_code}")
             
             # If none worked, log warning but don't fail
             logger.warning(f"Could not set resolution to {width}x{height} - may not be supported on this model")
