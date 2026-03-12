@@ -587,6 +587,31 @@ class AxisCamera:
             logger.warning(f"Could not adjust zoom for {self.mac}: {e}")
             return True  # Don't fail the whole process for zoom
     
+    def set_resolution(self, width: int = 1024, height: int = 768) -> bool:
+        """Set camera resolution.
+        
+        Args:
+            width: Resolution width in pixels (default: 1024)
+            height: Resolution height in pixels (default: 768)
+        """
+        try:
+            url = f"http://{self.ip}/axis-cgi/param.cgi"
+            
+            # Set resolution for video stream (Image.I0 is the main video stream)
+            param_string = f"action=update&root.Image.I0.Appearance.Resolution={width}x{height}"
+            response = self.session.get(url + "?" + param_string, timeout=VAPIX_TIMEOUT)
+            
+            if response.status_code == 200 and "Error" not in response.text:
+                logger.info(f"Resolution set to {width}x{height} for {self.mac}")
+                return True
+            else:
+                logger.warning(f"Resolution setting had issues: {response.text[:100]}")
+                return True  # Don't fail - may not be supported on all models
+                
+        except Exception as e:
+            logger.warning(f"Error setting resolution for {self.mac}: {e}")
+            return True  # Don't fail the whole process for resolution
+    
     def verify_configuration(self, expected_ip: str, expected_name: str = None) -> bool:
         """Verify that configuration was applied correctly."""
         try:
@@ -1501,28 +1526,32 @@ def configure_camera(camera: AxisCamera, config: Dict, csv_filename: str) -> boo
             raise Exception("Failed to set credentials")
         
         # Step 2: Set date/time/timezone
-        logger.info(f"Step 2/6: Setting timezone to {config.get('timezone', 'America/New_York')}...")
+        logger.info(f"Step 2/7: Setting timezone to {config.get('timezone', 'America/New_York')}...")
         camera.set_date_time(config.get('timezone', 'America/New_York'))  # Best effort, don't fail
         
         # Step 3: Set camera name (if provided)
         if config.get('name'):
-            logger.info("Step 3/6: Setting camera name...")
+            logger.info("Step 3/7: Setting camera name...")
             if not camera.set_camera_name(config['name']):
                 logger.warning("Failed to set camera name (may not be supported on this model)")
         else:
-            logger.info("Step 3/6: Skipping camera name (not provided)")
+            logger.info("Step 3/7: Skipping camera name (not provided)")
         
-        # Step 4: Set zoom
-        logger.info("Step 4/6: Setting zoom to minimum...")
+        # Step 4: Set resolution
+        logger.info("Step 4/7: Setting resolution to 1024x768...")
+        camera.set_resolution(1024, 768)  # Best effort, don't fail if not available
+        
+        # Step 5: Set zoom
+        logger.info("Step 5/7: Setting zoom to minimum...")
         camera.zoom_out_fully()  # Best effort, don't fail if not available
         
-        # Step 5: Set new IP address LAST (this may disrupt connection)
+        # Step 6: Set new IP address LAST (this may disrupt connection)
         subnet = config.get('subnet_mask', '255.255.255.0')
         gateway = config.get('gateway')
         if gateway:
-            logger.info(f"Step 5/6: Setting IP to {config['new_ip']}, subnet {subnet}, gateway {gateway}...")
+            logger.info(f"Step 6/7: Setting IP to {config['new_ip']}, subnet {subnet}, gateway {gateway}...")
         else:
-            logger.info(f"Step 5/6: Setting IP to {config['new_ip']}, subnet {subnet}...")
+            logger.info(f"Step 6/7: Setting IP to {config['new_ip']}, subnet {subnet}...")
         old_ip = camera.ip
         if not camera.set_network_config(config['new_ip'], subnet, gateway):
             raise Exception(f"Failed to set IP to {config['new_ip']}")
@@ -1531,8 +1560,8 @@ def configure_camera(camera: AxisCamera, config: Dict, csv_filename: str) -> boo
         logger.info("Waiting for camera to apply network settings...")
         time.sleep(5)
         
-        # Step 6: Verify configuration
-        logger.info("Step 6/6: Verifying configuration...")
+        # Step 7: Verify configuration
+        logger.info("Step 7/7: Verifying configuration...")
         if not camera.verify_configuration(config['new_ip'], config.get('name')):
             logger.warning("Configuration verification failed, but changes may have been applied")
             # Don't fail - verification can be flaky after network change
