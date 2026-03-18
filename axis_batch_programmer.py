@@ -48,6 +48,8 @@ FACTORY_INITIAL_PASSWORD = "pass"  # Temporary password to set on factory-fresh 
 #   2. Setting "root" password via the initial setup form
 #   The setup_initial_password() method handles both automatically
 VAPIX_TIMEOUT = 30  # For managed switches with rate limiting, increase to 30-60 seconds
+NETWORK_CONFIG_TIMEOUT = 60  # Longer timeout for network changes (important for VLANs)
+NETWORK_VERIFY_TIMEOUT = 45  # Timeout for verifying network changes
 DISCOVERY_TIMEOUT = 5
 
 # Timezone mapping: Common timezone names to POSIX format  
@@ -353,7 +355,7 @@ class AxisCamera:
             
             # Use GET request - Axis VAPIX often works better with GET for param updates
             try:
-                response = self.session.get(url + "?" + param_string, timeout=VAPIX_TIMEOUT)
+                response = self.session.get(url + "?" + param_string, timeout=NETWORK_CONFIG_TIMEOUT)
                 
                 # Note: 401 response with "OK" text often means the change was applied
                 # but the connection was interrupted due to network change
@@ -376,25 +378,44 @@ class AxisCamera:
                 
                 # Update our IP to the new one and wait for camera to come back online
                 self.ip = new_ip
-                time.sleep(8)  # Give camera extra time to apply network changes and reboot
                 
-                # Try to verify the new IP is reachable
-                try:
-                    logger.info(f"Verifying camera is online at new IP {new_ip}...")
-                    test_url = f"http://{new_ip}/axis-cgi/param.cgi?action=list&group=Network.eth0"
-                    test_response = self.session.get(test_url, timeout=VAPIX_TIMEOUT)
-                    
-                    if test_response.status_code == 200:
-                        logger.info(f"✓ Camera successfully reconfigured and online at {new_ip}")
-                        return True
-                    else:
-                        logger.warning(f"Camera responded at {new_ip} but with status {test_response.status_code}")
-                        return True  # Likely still success, camera may just be finalizing setup
+                # For VLAN environments, give extra time for routing table updates
+                logger.info("Waiting 15 seconds for network changes and routing updates...")
+                time.sleep(15)
+                
+                # Try multiple times to verify the new IP is reachable (important for VLANs)
+                max_verify_attempts = 5
+                verify_delay = 5  # seconds between attempts
+                
+                for attempt in range(1, max_verify_attempts + 1):
+                    try:
+                        logger.info(f"Verification attempt {attempt}/{max_verify_attempts}: Checking camera at {new_ip}...")
+                        test_url = f"http://{new_ip}/axis-cgi/param.cgi?action=list&group=Network.eth0"
+                        test_response = self.session.get(test_url, timeout=NETWORK_VERIFY_TIMEOUT)
                         
-                except Exception as verify_err:
-                    logger.warning(f"Could not verify new IP {new_ip}: {verify_err}")
-                    logger.info("Camera may still be rebooting - configuration likely succeeded")
-                    return True  # Assume success - verification is flaky after network change
+                        if test_response.status_code == 200:
+                            logger.info(f"✓ Camera successfully reconfigured and online at {new_ip}")
+                            return True
+                        else:
+                            logger.warning(f"Camera responded at {new_ip} but with status {test_response.status_code}")
+                            if attempt < max_verify_attempts:
+                                logger.info(f"Retrying in {verify_delay} seconds...")
+                                time.sleep(verify_delay)
+                            else:
+                                # Last attempt - accept any response as success
+                                logger.info("Camera responding - assuming network change succeeded")
+                                return True
+                                
+                    except Exception as verify_err:
+                        if attempt < max_verify_attempts:
+                            logger.warning(f"Verification attempt {attempt} failed: {verify_err}")
+                            logger.info(f"Retrying in {verify_delay} seconds...")
+                            time.sleep(verify_delay)
+                        else:
+                            logger.error(f"Could not verify new IP {new_ip} after {max_verify_attempts} attempts")
+                            logger.error(f"Last error: {verify_err}")
+                            logger.warning("Network change may have failed - camera may be at old IP or 192.168.0.90")
+                            return False  # Actually report failure after exhausting retries
                     
         except Exception as e:
             logger.error(f"Unexpected error setting network config: {e}")
