@@ -754,6 +754,7 @@ class AxisBatchProgrammerGUI:
                     
                     # Check if camera is reachable at expected IP
                     logger.info(f"Verifying {mac} at expected IP {expected_ip}...")
+                    logger.debug(f"Using credentials: {config['username']}/***")
                     
                     try:
                         test_session = requests.Session()
@@ -834,8 +835,13 @@ class AxisBatchProgrammerGUI:
                             })
                             
                             try:
-                                # Update camera object with found IP
+                                # Update camera object with found IP and ensure credentials are set
                                 camera.ip = found_ip
+                                camera.username = config['username']
+                                camera.password = config['password']
+                                camera.session.auth = HTTPDigestAuth(config['username'], config['password'])
+                                
+                                logger.info(f"Retrying with credentials: {config['username']}/***")
                                 
                                 # Retry network configuration
                                 net_result = camera.set_network_config(
