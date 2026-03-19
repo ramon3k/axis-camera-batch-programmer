@@ -12,6 +12,8 @@ import logging
 from datetime import datetime
 from pathlib import Path
 import sys
+import requests
+from requests.auth import HTTPDigestAuth
 
 # Import the core logic from the main program
 from axis_batch_programmer import (
@@ -722,6 +724,159 @@ class AxisBatchProgrammerGUI:
                         'status': 'Failed',
                         'message': 'Configuration failed - see log'
                     })
+            
+            # Final verification pass - check and retry any cameras with wrong IP
+            if success_count > 0:
+                logger.info("\n" + "="*70)
+                logger.info("Final Verification Pass - Checking IP addresses")
+                logger.info("="*70)
+                
+                self.status_queue.put({
+                    'status_bar': 'Final verification - checking camera IP addresses...'
+                })
+                
+                retry_count = 0
+                for cam_info in discovered:
+                    if not self.is_running:
+                        break
+                    
+                    mac = cam_info['mac']
+                    config = next((cfg for cfg in self.configs if cfg['mac'] == mac), None)
+                    
+                    if not config or not config.get('new_ip'):
+                        continue
+                    
+                    expected_ip = config['new_ip']
+                    camera = cam_info.get('camera')
+                    
+                    if not camera:
+                        continue
+                    
+                    # Check if camera is reachable at expected IP
+                    logger.info(f"Verifying {mac} at expected IP {expected_ip}...")
+                    
+                    try:
+                        test_session = requests.Session()
+                        test_session.auth = HTTPDigestAuth(config['username'], config['password'])
+                        test_session.trust_env = False
+                        test_session.proxies = {'http': None, 'https': None}
+                        
+                        test_url = f"http://{expected_ip}/axis-cgi/param.cgi?action=list&group=Network.eth0"
+                        test_response = test_session.get(test_url, timeout=10)
+                        
+                        if test_response.status_code == 200:
+                            logger.info(f"✓ Camera {mac} confirmed at {expected_ip}")
+                            continue
+                        else:
+                            logger.warning(f"⚠ Camera {mac} responded at {expected_ip} with status {test_response.status_code}")
+                            # Still accessible, probably fine
+                            continue
+                            
+                    except Exception as verify_err:
+                        logger.warning(f"✗ Cannot reach camera {mac} at expected IP {expected_ip}")
+                        logger.info(f"Searching for camera {mac}...")
+                        
+                        # Update status
+                        self.status_queue.put({
+                            'mac': mac,
+                            'status': 'Retrying',
+                            'message': 'IP verification failed, searching...'
+                        })
+                        
+                        # Search for camera at potential locations
+                        found_ip = None
+                        search_ips = [
+                            '192.168.0.90',  # Axis fallback IP
+                            cam_info.get('ip'),  # Original discovery IP
+                        ]
+                        
+                        # Add ARP scan for this specific MAC
+                        try:
+                            import subprocess
+                            result = subprocess.run(['arp', '-a'], capture_output=True, text=True, timeout=5)
+                            normalized_mac = mac.replace(':', '-').lower()
+                            
+                            for line in result.stdout.split('\n'):
+                                if normalized_mac in line.lower():
+                                    parts = line.split()
+                                    if len(parts) >= 1:
+                                        potential_ip = parts[0].strip()
+                                        if potential_ip not in search_ips:
+                                            search_ips.append(potential_ip)
+                                            logger.info(f"Found {mac} in ARP table at {potential_ip}")
+                        except:
+                            pass
+                        
+                        # Try each potential IP
+                        for search_ip in search_ips:
+                            if not search_ip:
+                                continue
+                                
+                            try:
+                                logger.info(f"Trying {mac} at {search_ip}...")
+                                test_url = f"http://{search_ip}/axis-cgi/param.cgi?action=list&group=Network.eth0"
+                                test_response = test_session.get(test_url, timeout=10)
+                                
+                                if test_response.status_code == 200:
+                                    found_ip = search_ip
+                                    logger.info(f"✓ Found camera {mac} at {found_ip}")
+                                    break
+                            except:
+                                continue
+                        
+                        if found_ip and found_ip != expected_ip:
+                            # Camera found at wrong IP - retry network configuration
+                            logger.info(f"Retrying network configuration for {mac}: {found_ip} → {expected_ip}")
+                            
+                            self.status_queue.put({
+                                'mac': mac,
+                                'message': f'Found at {found_ip}, reconfiguring to {expected_ip}...'
+                            })
+                            
+                            try:
+                                # Update camera object with found IP
+                                camera.ip = found_ip
+                                
+                                # Retry network configuration
+                                net_result = camera.set_network_config(
+                                    expected_ip,
+                                    config.get('subnet_mask', '255.255.255.0'),
+                                    config.get('gateway')
+                                )
+                                
+                                if net_result:
+                                    logger.info(f"✓ Successfully reconfigured {mac} to {expected_ip}")
+                                    retry_count += 1
+                                    self.status_queue.put({
+                                        'mac': mac,
+                                        'current_ip': expected_ip,
+                                        'message': f'Reconfigured successfully: {found_ip} → {expected_ip}'
+                                    })
+                                else:
+                                    logger.error(f"✗ Failed to reconfigure {mac}")
+                                    self.status_queue.put({
+                                        'mac': mac,
+                                        'current_ip': found_ip,
+                                        'message': f'Network reconfig failed - camera at {found_ip}'
+                                    })
+                            except Exception as retry_err:
+                                logger.error(f"✗ Error reconfiguring {mac}: {retry_err}")
+                                self.status_queue.put({
+                                    'mac': mac,
+                                    'current_ip': found_ip,
+                                    'message': f'Reconfig error - camera at {found_ip}'
+                                })
+                        elif found_ip:
+                            logger.info(f"Camera {mac} already at correct IP {found_ip}")
+                        else:
+                            logger.error(f"✗ Could not locate camera {mac}")
+                            self.status_queue.put({
+                                'mac': mac,
+                                'message': 'Camera not found - check network connection'
+                            })
+                
+                if retry_count > 0:
+                    logger.info(f"\nFinal verification: Fixed {retry_count} camera(s) with incorrect IP")
             
             # Final summary
             logger.info("\n" + "="*70)
