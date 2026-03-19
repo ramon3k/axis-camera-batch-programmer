@@ -1379,18 +1379,21 @@ def discover_cameras_on_network(configs: List[Dict] = None) -> List[Dict]:
                 except Exception as e:
                     logger.debug(f"  Initial setup check error: {e}")
                 
-                # If setup automation failed, skip trying factory credentials
-                # (camera is still in setup mode and won't respond to API calls)
+                # If setup automation failed, check if it's truly in setup mode or just needs CSV credentials
                 if not setup_success:
-                    # Check if camera is still in setup mode (401 on all requests)
+                    # Check if camera responds to unauthenticated requests (true setup mode)
+                    # vs. requires authentication (already configured)
                     try:
                         test_url = f"http://{ip}/axis-cgi/param.cgi?action=list&group=Network"
                         test_resp = requests.get(test_url, timeout=5, proxies={'http': None, 'https': None})
+                        
+                        # 401 means authentication required - could be setup mode OR already configured
+                        # We should still try CSV credentials
                         if test_resp.status_code == 401:
-                            logger.error(f"  ✗ Camera at {ip} requires MANUAL initial setup")
-                            logger.error(f"  ACTION REQUIRED: Open http://{ip}/ in browser, accept EULA, set password to '{FACTORY_INITIAL_PASSWORD}'")
-                            logger.error(f"  Then run this program again to configure the camera")
-                            continue  # Skip this camera
+                            logger.info(f"  Camera at {ip} requires authentication - will try CSV credentials")
+                        elif test_resp.status_code == 200:
+                            # Camera responding without auth - unusual but proceed
+                            logger.debug(f"  Camera at {ip} responding without authentication")
                     except:
                         pass
                 
@@ -1422,24 +1425,29 @@ def discover_cameras_on_network(configs: List[Dict] = None) -> List[Dict]:
                         continue
                 
                 # Try CSV credentials (for already-programmed cameras)
+                # Always try CSV credentials, even if factory credentials worked
+                # This ensures we use the correct credentials for already-configured cameras
                 if not camera and cfg:
                     try:
-                        logger.info(f"  Attempting {ip} ({mac}) with CSV credentials (user: {csv_username})...")
+                        logger.info(f"  Attempting {ip} ({mac}) with CSV credentials ({csv_username}/***) ...")
                         camera = AxisCamera(ip, mac, csv_username, csv_password)
                         camera_mac = camera.get_mac_address()
                         
                         if camera_mac and camera_mac == mac:
                             auth_method = 'csv_credentials'
-                            logger.info(f"  ✓ SUCCESS: Camera at {ip} authenticated with CSV credentials")
+                            logger.info(f"  ✓ SUCCESS: Camera at {ip} authenticated with CSV credentials ({csv_username})")
                         else:
+                            logger.warning(f"  ✗ CSV credentials failed to authenticate camera at {ip}")
                             camera = None
                     except Exception as e:
-                        logger.debug(f"  CSV credentials failed: {e}")
+                        logger.warning(f"  ✗ CSV credentials failed: {e}")
                         camera = None
                 
-                # Log failure for this device
+                # Log overall failure for this device
                 if not camera:
-                    logger.warning(f"  ✗ FAILED: Could not authenticate to {ip} ({mac}) - Check credentials in CSV")
+                    logger.error(f"  ✗ FAILED: Could not authenticate to camera {mac} at {ip}")
+                    logger.error(f"  Tried: Factory credentials and CSV credentials ({csv_username}/***)")
+                    logger.error(f"  Verify camera is accessible and credentials in CSV are correct")
                 
                 # If we successfully connected, add to discovered list
                 if camera:
