@@ -614,6 +614,9 @@ class AxisCamera:
         Args:
             width: Resolution width in pixels (default: 1024)
             height: Resolution height in pixels (default: 768)
+        
+        Note: Some cameras may briefly disconnect when resolution changes.
+        This function handles connection errors gracefully and won't fail the configuration.
         """
         try:
             url = f"http://{self.ip}/axis-cgi/param.cgi"
@@ -629,29 +632,63 @@ class AxisCamera:
             ]
             
             for param in resolution_params:
-                param_string = f"action=update&{param}"
-                logger.info(f"Trying resolution parameter: {param.split('=')[0]}")
-                response = self.session.get(url + "?" + param_string, timeout=VAPIX_TIMEOUT)
-                
-                # Success is indicated by HTTP 200 with "OK" response (not containing "Error")
-                if response.status_code == 200:
-                    response_text = response.text.strip()
-                    if response_text == "OK" or (response_text and "error" not in response_text.lower()):
-                        logger.info(f"✓ Resolution set to {width}x{height} for {self.mac}")
-                        logger.info(f"  Used parameter: {param.split('=')[0]}")
-                        return True
+                try:
+                    param_string = f"action=update&{param}"
+                    logger.info(f"Trying resolution parameter: {param.split('=')[0]}")
+                    response = self.session.get(url + "?" + param_string, timeout=VAPIX_TIMEOUT)
+                    
+                    # Success is indicated by HTTP 200 with "OK" response (not containing "Error")
+                    if response.status_code == 200:
+                        response_text = response.text.strip()
+                        if response_text == "OK" or (response_text and "error" not in response_text.lower()):
+                            logger.info(f"✓ Resolution set to {width}x{height} for {self.mac}")
+                            logger.info(f"  Used parameter: {param.split('=')[0]}")
+                            
+                            # Some cameras may briefly disconnect after resolution change
+                            # Wait a moment and recreate session if needed
+                            time.sleep(2)
+                            return True
+                        else:
+                            logger.debug(f"  Response: {response_text[:100]}")
                     else:
-                        logger.debug(f"  Response: {response_text[:100]}")
-                else:
-                    logger.debug(f"  HTTP {response.status_code}")
+                        logger.debug(f"  HTTP {response.status_code}")
+                
+                except requests.exceptions.ConnectionError as conn_err:
+                    # Camera may have briefly disconnected due to resolution change
+                    logger.info(f"  Connection interrupted (camera may be adjusting resolution)")
+                    logger.info(f"  Waiting for camera to stabilize...")
+                    time.sleep(3)
+                    
+                    # Try to reconnect with a fresh session
+                    try:
+                        self.session = requests.Session()
+                        self.session.auth = HTTPDigestAuth(self.username, self.password)
+                        # Test reconnection
+                        test_response = self.session.get(f"http://{self.ip}/axis-cgi/param.cgi?action=list&group=Brand", timeout=10)
+                        if test_response.status_code == 200:
+                            logger.info(f"  ✓ Reconnected successfully")
+                            # Resolution may have been set despite connection error
+                            return True
+                        else:
+                            logger.warning(f"  Reconnection returned status {test_response.status_code}")
+                    except Exception as reconnect_err:
+                        logger.warning(f"  Reconnection failed: {reconnect_err}")
+                    
+                    # Continue trying other parameters
+                    continue
+                
+                except Exception as param_err:
+                    logger.debug(f"  Error with this parameter: {param_err}")
+                    continue
             
             # If none worked, log warning but don't fail
-            logger.warning(f"Could not set resolution to {width}x{height} - may not be supported on this model")
+            logger.warning(f"Could not confirm resolution set to {width}x{height} - may not be supported or camera disconnected")
             logger.warning(f"Resolution remains at camera default")
             return True  # Don't fail - may not be supported on all models
                 
         except Exception as e:
             logger.warning(f"Error setting resolution for {self.mac}: {e}")
+            logger.warning(f"Continuing with configuration...")
             return True  # Don't fail the whole process for resolution
     
     def verify_configuration(self, expected_ip: str, expected_name: str = None) -> bool:
