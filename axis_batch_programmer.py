@@ -414,12 +414,13 @@ class AxisCamera:
                         else:
                             logger.error(f"Could not verify new IP {new_ip} after {max_verify_attempts} attempts")
                             logger.error(f"Last error: {verify_err}")
-                            logger.warning("Network change may have failed - searching for camera at old IP or default IP...")
+                            logger.warning("Network change may have failed - searching for camera...")
                             
-                            # Try to find camera at old IP or default IP and retry
+                            # Try to find camera at old IP, default IP, or by MAC in ARP table
                             search_ips = [old_ip, '192.168.0.90']
                             found_ip = None
                             
+                            # First, try the known IPs
                             for search_ip in search_ips:
                                 if search_ip == new_ip:
                                     continue  # Already tried this
@@ -441,6 +442,33 @@ class AxisCamera:
                                 except Exception as search_err:
                                     logger.debug(f"Camera not at {search_ip}: {search_err}")
                                     continue
+                            
+                            # If not found at known IPs, search ARP table by MAC address
+                            if not found_ip:
+                                logger.info(f"Searching ARP table for camera {self.mac}...")
+                                arp_table = get_arp_table()
+                                
+                                if self.mac in arp_table:
+                                    arp_ip = arp_table[self.mac]
+                                    if arp_ip != new_ip:  # Don't retry the IP we already failed at
+                                        logger.info(f"Found camera at {arp_ip} via ARP table (MAC: {self.mac})")
+                                        
+                                        try:
+                                            # Verify it's really our camera
+                                            test_url = f"http://{arp_ip}/axis-cgi/param.cgi?action=list&group=Brand"
+                                            test_session = requests.Session()
+                                            test_session.auth = HTTPDigestAuth(self.username, self.password)
+                                            test_response = test_session.get(test_url, timeout=10)
+                                            
+                                            if test_response.status_code == 200:
+                                                logger.info(f"✓ Confirmed camera at {arp_ip} via HTTP")
+                                                found_ip = arp_ip
+                                                self.ip = arp_ip
+                                                self.session = test_session
+                                        except Exception as arp_verify_err:
+                                            logger.warning(f"Could not verify camera at ARP IP {arp_ip}: {arp_verify_err}")
+                                else:
+                                    logger.warning(f"Camera MAC {self.mac} not found in ARP table")
                             
                             if found_ip:
                                 logger.info(f"Camera found at {found_ip}, retrying network configuration to {new_ip}...")
@@ -477,7 +505,8 @@ class AxisCamera:
                                     logger.error(f"Camera may still be at {found_ip}")
                                     return False
                             else:
-                                logger.error(f"Could not find camera at {new_ip}, {old_ip}, or 192.168.0.90")
+                                logger.error(f"Could not find camera {self.mac} at any IP")
+                                logger.error("Checked: new IP, old IP, 192.168.0.90, and ARP table")
                                 logger.error("Manual intervention may be required")
                                 return False
                     
