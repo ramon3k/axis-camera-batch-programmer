@@ -414,8 +414,72 @@ class AxisCamera:
                         else:
                             logger.error(f"Could not verify new IP {new_ip} after {max_verify_attempts} attempts")
                             logger.error(f"Last error: {verify_err}")
-                            logger.warning("Network change may have failed - camera may be at old IP or 192.168.0.90")
-                            return False  # Actually report failure after exhausting retries
+                            logger.warning("Network change may have failed - searching for camera at old IP or default IP...")
+                            
+                            # Try to find camera at old IP or default IP and retry
+                            search_ips = [old_ip, '192.168.0.90']
+                            found_ip = None
+                            
+                            for search_ip in search_ips:
+                                if search_ip == new_ip:
+                                    continue  # Already tried this
+                                    
+                                try:
+                                    logger.info(f"Checking if camera is at {search_ip}...")
+                                    # Update session to point to search IP temporarily
+                                    test_url = f"http://{search_ip}/axis-cgi/param.cgi?action=list&group=Brand"
+                                    test_session = requests.Session()
+                                    test_session.auth = HTTPDigestAuth(self.username, self.password)
+                                    test_response = test_session.get(test_url, timeout=10)
+                                    
+                                    if test_response.status_code == 200:
+                                        logger.info(f"✓ Found camera at {search_ip}!")
+                                        found_ip = search_ip
+                                        self.ip = search_ip
+                                        self.session = test_session
+                                        break
+                                except Exception as search_err:
+                                    logger.debug(f"Camera not at {search_ip}: {search_err}")
+                                    continue
+                            
+                            if found_ip:
+                                logger.info(f"Camera found at {found_ip}, retrying network configuration to {new_ip}...")
+                                logger.info("Waiting 5 seconds before retry...")
+                                time.sleep(5)
+                                
+                                # Retry the network configuration
+                                try:
+                                    param_string = f"action=update&root.Network.IPAddress={new_ip}&root.Network.SubnetMask={subnet_mask}"
+                                    if gateway:
+                                        param_string += f"&root.Network.DefaultRouter={gateway}"
+                                    
+                                    url = f"http://{self.ip}/axis-cgi/param.cgi"
+                                    retry_response = self.session.get(url + "?" + param_string, timeout=NETWORK_CONFIG_TIMEOUT)
+                                    
+                                    logger.info(f"Retry network config sent, waiting 15 seconds...")
+                                    self.ip = new_ip
+                                    time.sleep(15)
+                                    
+                                    # Verify after retry
+                                    test_url = f"http://{new_ip}/axis-cgi/param.cgi?action=list&group=Network.eth0"
+                                    final_test = self.session.get(test_url, timeout=NETWORK_VERIFY_TIMEOUT)
+                                    
+                                    if final_test.status_code == 200:
+                                        logger.info(f"✓ RETRY SUCCESSFUL: Camera now at {new_ip}")
+                                        return True
+                                    else:
+                                        logger.warning(f"Retry verification returned status {final_test.status_code}")
+                                        logger.warning(f"Camera may still be at {found_ip} - check manually")
+                                        return False
+                                        
+                                except Exception as retry_err:
+                                    logger.error(f"Retry failed: {retry_err}")
+                                    logger.error(f"Camera may still be at {found_ip}")
+                                    return False
+                            else:
+                                logger.error(f"Could not find camera at {new_ip}, {old_ip}, or 192.168.0.90")
+                                logger.error("Manual intervention may be required")
+                                return False
                     
         except Exception as e:
             logger.error(f"Unexpected error setting network config: {e}")
