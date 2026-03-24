@@ -14,6 +14,7 @@ from pathlib import Path
 import sys
 import requests
 from requests.auth import HTTPDigestAuth
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Import the core logic from the main program
 from axis_batch_programmer import (
@@ -594,7 +595,127 @@ class AxisBatchProgrammerGUI:
                         'message': 'Camera not discovered'
                     })
             
-            # Step 2: Configure each discovered camera
+            # Step 2: Firmware upgrade FIRST (if enabled) - All cameras in parallel
+            firmware_upgraded_count = 0
+            firmware_failed_count = 0
+            firmware_results = []  # Track firmware upgrade results
+            
+            if self.firmware_var.get() and self.firmware_file:
+                logger.info("\n" + "="*70)
+                logger.info(f"STEP 2: FIRMWARE UPGRADE (Parallel - All {len(discovered)} cameras at once)")
+                logger.info("="*70)
+                
+                self.status_queue.put({
+                    'status_bar': f'Upgrading firmware on {len(discovered)} cameras in parallel...'
+                })
+                
+                # Mark all cameras as upgrading
+                for cam_info in discovered:
+                    self.status_queue.put({
+                        'mac': cam_info['mac'],
+                        'status': 'Upgrading',
+                        'message': 'Starting firmware upgrade...'
+                    })
+                
+                # Function to upgrade one camera (for parallel execution)
+                def upgrade_one_camera(cam_info):
+                    mac = cam_info['mac']
+                    camera = cam_info['camera']
+                    
+                    try:
+                        logger.info(f"\n{'='*70}")
+                        logger.info(f"Firmware Upgrade: {mac} at {camera.ip}")
+                        logger.info(f"{'='*70}")
+                        
+                        # Progress callback for this specific camera
+                        def firmware_progress(stage, message):
+                            self.status_queue.put({
+                                'mac': mac,
+                                'message': f'Firmware: {message}'
+                            })
+                        
+                        # Perform firmware upgrade
+                        success = camera.upgrade_firmware(
+                            self.firmware_file,
+                            progress_callback=firmware_progress
+                        )
+                        
+                        if success:
+                            logger.info(f"✓ Firmware upgrade successful for {mac}")
+                            self.status_queue.put({
+                                'mac': mac,
+                                'message': 'Firmware upgraded successfully'
+                            })
+                            return {'mac': mac, 'success': True, 'camera': camera}
+                        else:
+                            logger.error(f"✗ Firmware upgrade failed for {mac}")
+                            self.status_queue.put({
+                                'mac': mac,
+                                'status': 'Failed',
+                                'message': 'Firmware upgrade failed - see log'
+                            })
+                            return {'mac': mac, 'success': False, 'camera': camera}
+                            
+                    except Exception as e:
+                        logger.error(f"✗ Firmware upgrade error for {mac}: {e}", exc_info=True)
+                        self.status_queue.put({
+                            'mac': mac,
+                            'status': 'Failed',
+                            'message': f'Firmware error: {str(e)[:50]}'
+                        })
+                        return {'mac': mac, 'success': False, 'camera': camera, 'error': str(e)}
+                
+                # Execute firmware upgrades in parallel
+                firmware_results = []
+                with ThreadPoolExecutor(max_workers=min(len(discovered), 10)) as executor:
+                    # Submit all firmware upgrade jobs
+                    future_to_cam = {executor.submit(upgrade_one_camera, cam_info): cam_info for cam_info in discovered}
+                    
+                    # Wait for all to complete
+                    for future in as_completed(future_to_cam):
+                        if not self.is_running:
+                            logger.warning("Programming stopped by user")
+                            executor.shutdown(wait=False, cancel_futures=True)
+                            break
+                        
+                        result = future.result()
+                        firmware_results.append(result)
+                        
+                        if result['success']:
+                            firmware_upgraded_count += 1
+                        else:
+                            firmware_failed_count += 1
+                        
+                        # Update progress
+                        total_done = firmware_upgraded_count + firmware_failed_count
+                        self.status_queue.put({
+                            'status_bar': f'Firmware: {total_done}/{len(discovered)} complete ({firmware_upgraded_count} success, {firmware_failed_count} failed)'
+                        })
+                
+                logger.info(f"\n{'='*70}")
+                logger.info(f"Firmware Upgrade Complete: {firmware_upgraded_count} success, {firmware_failed_count} failed")
+                logger.info(f"{'='*70}\n")
+                
+                # Update discovered list with new camera states after firmware
+                # (cameras may have changed IPs during firmware upgrade)
+                for result in firmware_results:
+                    if result['success']:
+                        # Update the camera object in discovered list
+                        for cam_info in discovered:
+                            if cam_info['mac'] == result['mac']:
+                                cam_info['camera'] = result['camera']
+                                cam_info['ip'] = result['camera'].ip
+                                break
+            else:
+                logger.info("\n" + "="*70)
+                logger.info("STEP 2: FIRMWARE UPGRADE - Skipped (not enabled)")
+                logger.info("="*70 + "\n")
+            
+            # Step 3: Configure each discovered camera
+            logger.info("\n" + "="*70)
+            logger.info(f"STEP 3: CONFIGURATION (Setting credentials, timezone, name, resolution, IP)")
+            logger.info("="*70)
+            
             success_count = 0
             failed_count = 0
             
@@ -611,6 +732,14 @@ class AxisBatchProgrammerGUI:
                     logger.warning(f"No configuration found for discovered camera {mac}")
                     continue
                 
+                # Skip if firmware upgrade failed for this camera
+                if self.firmware_var.get() and self.firmware_file:
+                    firmware_result = next((r for r in firmware_results if r['mac'] == mac), None)
+                    if firmware_result and not firmware_result['success']:
+                        logger.warning(f"Skipping configuration for {mac} - firmware upgrade failed")
+                        failed_count += 1
+                        continue
+                
                 # Update status to configuring
                 self.status_queue.put({
                     'mac': mac,
@@ -626,91 +755,6 @@ class AxisBatchProgrammerGUI:
                 result = configure_camera(cam_info['camera'], config, self.csv_filename)
                 
                 if result:
-                    # Firmware upgrade (if enabled) - happens AFTER standard configuration
-                    if self.firmware_var.get() and self.firmware_file:
-                        self.status_queue.put({
-                            'mac': mac,
-                            'status': 'Upgrading',
-                            'message': 'Upgrading firmware...'
-                        })
-                        
-                        self.status_queue.put({
-                            'status_bar': f'Upgrading firmware on {mac}... ({success_count + failed_count + 1}/{len(discovered)})'
-                        })
-                        
-                        logger.info(f"\n{'='*70}")
-                        logger.info(f"Firmware Upgrade: {mac}")
-                        logger.info(f"{'='*70}")
-                        
-                        # Create progress callback that updates status_queue
-                        def firmware_progress(stage, message):
-                            self.status_queue.put({
-                                'mac': mac,
-                                'message': f'Firmware: {message}'
-                            })
-                        
-                        try:
-                            firmware_success = cam_info['camera'].upgrade_firmware(
-                                self.firmware_file, 
-                                progress_callback=firmware_progress
-                            )
-                            
-                            if firmware_success:
-                                logger.info(f"✓ Firmware upgrade successful for {mac}")
-                                self.status_queue.put({
-                                    'mac': mac,
-                                    'message': 'Firmware upgraded, reconfiguring network...'
-                                })
-                                
-                                # Firmware upgrade may have changed camera IP to DHCP
-                                # Reconfigure network back to desired static IP from CSV
-                                if config['new_ip'] and 'camera' in cam_info:
-                                    camera = cam_info['camera']
-                                    logger.info(f"Reconfiguring network after firmware upgrade: {camera.ip} → {config['new_ip']}")
-                                    
-                                    try:
-                                        net_success = camera.set_network_config(
-                                            config['new_ip'],
-                                            config.get('subnet_mask', '255.255.255.0'),
-                                            config.get('gateway')
-                                        )
-                                        
-                                        if net_success:
-                                            logger.info(f"✓ Network reconfigured successfully after firmware upgrade")
-                                            self.status_queue.put({
-                                                'mac': mac,
-                                                'message': 'Firmware upgraded and network reconfigured'
-                                            })
-                                        else:
-                                            logger.warning(f"⚠ Network reconfiguration failed but firmware upgraded")
-                                            self.status_queue.put({
-                                                'mac': mac,
-                                                'message': 'Firmware upgraded, manual network config needed'
-                                            })
-                                    except Exception as net_err:
-                                        logger.warning(f"⚠ Network reconfiguration error: {net_err}")
-                                        self.status_queue.put({
-                                            'mac': mac,
-                                            'message': 'Firmware upgraded, network reconfig error'
-                                        })
-                                else:
-                                    self.status_queue.put({
-                                        'mac': mac,
-                                        'message': 'Firmware upgraded successfully'
-                                    })
-                            else:
-                                logger.warning(f"✗ Firmware upgrade failed for {mac}")
-                                self.status_queue.put({
-                                    'mac': mac,
-                                    'message': 'Configuration OK, firmware upgrade failed - see log'
-                                })
-                        except Exception as fw_error:
-                            logger.error(f"✗ Firmware upgrade error for {mac}: {fw_error}", exc_info=True)
-                            self.status_queue.put({
-                                'mac': mac,
-                                'message': f'Configuration OK, firmware error: {fw_error}'
-                            })
-                    
                     success_count += 1
                     self.status_queue.put({
                         'mac': mac,
@@ -725,10 +769,10 @@ class AxisBatchProgrammerGUI:
                         'message': 'Configuration failed - see log'
                     })
             
-            # Final verification pass - check and retry any cameras with wrong IP
+            # Step 4: Final verification pass - check and retry any cameras with wrong IP
             if success_count > 0:
                 logger.info("\n" + "="*70)
-                logger.info("Final Verification Pass - Checking IP addresses")
+                logger.info("STEP 4: FINAL VERIFICATION - Checking IP addresses")
                 logger.info("="*70)
                 
                 self.status_queue.put({
